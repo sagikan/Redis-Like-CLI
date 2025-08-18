@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 
 fn main() {
@@ -8,7 +8,16 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                stream.write_all(b"+PONG\r\n").unwrap();
+                let mut buf = vec![0; 1024];
+                loop {
+                    let read_count = stream.read(&mut buf).unwrap();
+                    if read_count == 0 {
+                        break;
+                    }
+                    
+                    stream.write_all(b"+PONG\r\n").unwrap();
+                }
+                
             }
             Err(e) => {
                 println!("error: {}", e);
