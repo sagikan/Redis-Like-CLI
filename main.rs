@@ -1,9 +1,15 @@
 #![allow(unused_imports)]
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, Duration};
+
+async fn insert_pair(key: String, val: String, socket: &mut TcpStream, mut guard: MutexGuard<'_, HashMap<String, String>>) {
+    guard.insert(key, val);
+    socket.write_all(b"+OK\r\n").await.unwrap();
+}
 
 async fn cmd_echo(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     if let Some(_val) = parsed_cmd.get(1) {
@@ -14,18 +20,55 @@ async fn cmd_echo(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     }
 }
 
-async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &mut Arc<Mutex<HashMap<String, String>>>) {
-    if parsed_cmd.len() != 3 {
-        socket.write_all(b"-ERR wrong number of arguments for 'set' command\r\n").await.unwrap();
-        return;
-    }
+async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, String>>>) {
+    let guard = pairs.lock().await;
 
-    // Insert key-value pair
-    pairs.lock().await.insert(parsed_cmd[1].clone(), parsed_cmd[2].clone());
-    socket.write_all(b"+OK\r\n").await.unwrap();
+    match parsed_cmd.len() {
+        3 => { // SET [Key] [Value]
+            insert_pair(parsed_cmd[1].clone(), parsed_cmd[2].clone(), socket, guard).await;
+        }, 4 => { // SET [Key] [Value] [NX / XX / Wrong Syntax]
+            match parsed_cmd[3].to_uppercase().as_str() {
+                "NX" => {
+                    // Set only if key does not already exist
+                    match guard.contains_key(&parsed_cmd[1]) {
+                        true => socket.write_all(b"$-1\r\n").await.unwrap(),
+                        false => insert_pair(parsed_cmd[1].clone(), parsed_cmd[2].clone(), socket, guard).await
+                    }
+                }, "XX" => {
+                    // Set only if key already exists
+                    match guard.contains_key(&parsed_cmd[1]) {
+                        true => insert_pair(parsed_cmd[1].clone(), parsed_cmd[2].clone(), socket, guard).await,
+                        false => socket.write_all(b"$-1\r\n").await.unwrap()
+                    }
+                }, _ => socket.write_all(b"-ERR syntax error\r\n").await.unwrap()
+            }
+        }, 5 => { // SET [Key] [Value] [EX / PX / Wrong Syntax] [Stringified Number / Wrong Syntax]
+            match parsed_cmd[3].to_uppercase().as_str() {
+                arg @ ("EX" | "PX") => {
+                    // Extract expiry (+ parse to milliseconds)
+                    let expiry = match parsed_cmd[4].parse::<i32>() {
+                        Ok(val) => if arg == "EX" { val * 1000 } else { val },
+                        Err(_) => {
+                            socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
+                            return;
+                        }
+                    };
+                    
+                    // Insert and remove after [expiry] ms via Tokio runtime
+                    insert_pair(parsed_cmd[1].clone(), parsed_cmd[2].clone(), socket, guard).await;
+                    let tokio_pairs = Arc::clone(&pairs);
+                    let tokio_key = parsed_cmd[1].clone();
+                    tokio::spawn(async move {
+                        sleep(Duration::from_millis(expiry as u64)).await;
+                        tokio_pairs.lock().await.remove(&tokio_key);
+                    });
+                }, _ => socket.write_all(b"-ERR syntax error\r\n").await.unwrap()
+            }
+        }, _ => socket.write_all(b"-ERR wrong number of arguments for 'set' command\r\n").await.unwrap()
+    }
 }
 
-async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &mut Arc<Mutex<HashMap<String, String>>>) {
+async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, String>>>) {
     if parsed_cmd.len() != 2 {
         socket.write_all(b"-ERR wrong number of arguments for 'get' command\r\n").await.unwrap();
         return;
@@ -43,16 +86,17 @@ async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &mut A
 }
 
 async fn cmd_other(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
-    // Emit error string
+    // Build error string
     let mut err_str = format!("-ERR unknown command `{}`, with args beginning with: ", parsed_cmd[0]);
     for arg in &parsed_cmd[1..] {
         err_str.push_str(&format!("`{}`, ", arg));
     }
     err_str.push_str("\r\n");
+
     socket.write_all(err_str.as_bytes()).await.unwrap();
 }
 
-async fn process_cmd(cmd: &[u8], socket: &mut TcpStream, pairs: &mut Arc<Mutex<HashMap<String, String>>>) {
+async fn process_cmd(cmd: &[u8], socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, String>>>) {
     let parsed_cmd: Vec<String> = resp_parse(cmd).await;
 
     // Handle by command
@@ -98,13 +142,13 @@ async fn main() {
 
         // Tokio runtime read-write function
         tokio::spawn(async move {
-            let mut pairs: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+            let pairs: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
             let mut buf = vec![0; 1024];
 
             loop {
                 match socket.read(&mut buf).await {
                     Ok(0) => return, // Connection closed
-                    Ok(n) => process_cmd(&buf[0..n], &mut socket, &mut pairs).await,
+                    Ok(n) => process_cmd(&buf[0..n], &mut socket, &pairs).await,
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         return;
