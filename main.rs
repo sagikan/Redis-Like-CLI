@@ -128,8 +128,8 @@ async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
     socket.write_all(format!("+{}\r\n", val).as_bytes()).await.unwrap();
 }
 
-async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
-                   pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                  pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     if parsed_cmd.len() < 3 {
         socket.write_all(b"-ERR wrong number of arguments for 'rpush' command\r\n").await.unwrap();
         return;
@@ -146,7 +146,10 @@ async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
         val_list_len
     } // Insert values to an existing string list if found
     else if let Some(Value::ValStringList(val_list)) = guard.get_mut(key) {
-        val_list.extend(parsed_cmd[2..].iter().cloned());
+        match from_right {
+            true => val_list.extend(parsed_cmd[2..].iter().cloned()),
+            false => for val in parsed_cmd[2..].iter() { val_list.push_front(val.clone()); }
+        }
         val_list.len()
     } // Emit an error message if value is of the wrong type
     else {
@@ -243,7 +246,8 @@ async fn process_cmd(cmd: &[u8], socket: &mut TcpStream,
         "ECHO" => cmd_echo(&parsed_cmd, socket).await,
         "SET" => cmd_set(&parsed_cmd, socket, pairs).await,
         "GET" => cmd_get(&parsed_cmd, socket, pairs).await,
-        "RPUSH" => cmd_rpush(&parsed_cmd, socket, pairs).await,
+        "RPUSH" => cmd_push(true, &parsed_cmd, socket, pairs).await,
+        "LPUSH" => cmd_push(false, &parsed_cmd, socket, pairs).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, socket, pairs).await,
         _ => cmd_other(&parsed_cmd, socket).await
     }
