@@ -1,6 +1,8 @@
 #![allow(unused_imports)]
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
+use std::future::Future;
+use std::cmp::min;
 use tokio::sync::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -19,7 +21,15 @@ fn extract_str(val: &Value) -> Option<String> {
     }
 }
 
-async fn set_pair(key: String, val: Value, socket: &mut TcpStream, mut guard: MutexGuard<'_, HashMap<String, Value>>) {
+async fn str_to_i32<FOk: Fn(i32) -> i32>(to_parse: &String, ok_logic: FOk) -> Option<i32> {
+    match to_parse.parse::<i32>() {
+        Ok(val) => Some(ok_logic(val)),
+        Err(_) => None
+    }
+}
+
+async fn set_pair(key: String, val: Value, socket: &mut TcpStream,
+                  mut guard: MutexGuard<'_, HashMap<String, Value>>) {
     guard.insert(key, val);
     socket.write_all(b"+OK\r\n").await.unwrap();
 }
@@ -33,7 +43,8 @@ async fn cmd_echo(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     }
 }
 
-async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                 pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     let guard = pairs.lock().await;
 
     match parsed_cmd.len() {
@@ -58,15 +69,23 @@ async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<M
         }, 5 => { // SET [Key] [Value] [EX / PX / Wrong Syntax] [Stringified Number / Wrong Syntax]
             match parsed_cmd[3].to_uppercase().as_str() {
                 arg @ ("EX" | "PX") => {
-                    // Extract expiry (+ parse to milliseconds)
-                    let expiry = match parsed_cmd[4].parse::<i32>() {
-                        Ok(val) => if arg == "EX" { val * 1000 } else { val },
-                        Err(_) => {
+                    // Extract expiry time (+ parse to milliseconds)
+                    let expiry = match str_to_i32(&parsed_cmd[4],
+                        |val| if arg == "EX" { val * 1000 } else { val }
+                    ).await {
+                        Some(v) => v,
+                        None => {
                             socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
                             return;
                         }
                     };
                     
+                    // Make sure of valid expire time
+                    if expiry <= 0 {
+                        socket.write_all(b"-ERR invalid expire time in 'set' command\r\n").await.unwrap();
+                        return;
+                    }
+
                     // Insert and remove after [expiry] ms via Tokio runtime
                     set_pair(parsed_cmd[1].clone(), Value::ValString(parsed_cmd[2].clone()), socket, guard).await;
                     let tokio_pairs = Arc::clone(&pairs);
@@ -81,7 +100,8 @@ async fn cmd_set(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<M
     }
 }
 
-async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                 pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     if parsed_cmd.len() != 2 {
         socket.write_all(b"-ERR wrong number of arguments for 'get' command\r\n").await.unwrap();
         return;
@@ -108,15 +128,16 @@ async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<M
     socket.write_all(format!("+{}\r\n", val).as_bytes()).await.unwrap();
 }
 
-async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                   pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     if parsed_cmd.len() < 3 {
         socket.write_all(b"-ERR wrong number of arguments for 'rpush' command\r\n").await.unwrap();
         return;
     }
 
-    let mut guard = pairs.lock().await;
     let key = &parsed_cmd[1];
-
+    
+    let mut guard = pairs.lock().await;
     // Create and insert string list if no such key is found
     let val_list_len = if !guard.contains_key(key) {
         let val_list: VecDeque<String> = parsed_cmd[2..].iter().cloned().collect();
@@ -127,7 +148,7 @@ async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc
     else if let Some(Value::ValStringList(val_list)) = guard.get_mut(key) {
         val_list.extend(parsed_cmd[2..].iter().cloned());
         val_list.len()
-    } // Emit error message if value is of the wrong type
+    } // Emit an error message if value is of the wrong type
     else {
         socket.write_all(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n").await.unwrap();
         return;
@@ -135,6 +156,70 @@ async fn cmd_rpush(parsed_cmd: &Vec<String>, socket: &mut TcpStream, pairs: &Arc
 
     // Emit the list's length
     socket.write_all(format!(":{}\r\n", val_list_len).as_bytes()).await.unwrap();
+}
+
+async fn cmd_lrange(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                    pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+    if parsed_cmd.len() != 4 {
+        socket.write_all(b"-ERR wrong number of arguments for 'lrange' command\r\n").await.unwrap();
+        return;
+    }
+
+    // Extract key, start and stop args
+    let key = &parsed_cmd[1];
+    let mut start = match str_to_i32(&parsed_cmd[2],
+        |val| val
+    ).await {
+        Some(v) => v,
+        None => {
+            socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
+            return;
+        }
+    };
+    let mut stop = match str_to_i32(&parsed_cmd[3],
+        |val| val
+    ).await {
+        Some(v) => v,
+        None => {
+            socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
+            return;
+        }
+    };
+    
+    let mut guard = pairs.lock().await;
+    // Emit an empty array if no such key is found
+    if !guard.contains_key(key) {
+        socket.write_all(b"*0\r\n").await.unwrap();
+    } // Emit a ranged list if an existing string list is found
+    else if let Some(Value::ValStringList(val_list)) = guard.get_mut(key) {
+        // Adjust and clamp start and stop
+        let val_list_len: i32 = val_list.len() as i32;
+        let adjust = |x: i32| if x < 0 { val_list_len + x } else { x };
+        start = adjust(start);
+        stop = adjust(stop);
+        if start < 0 { start = 0; }
+        if stop < 0 { stop = -1; }
+        // + Clamp stop to list range
+        stop = min(stop, val_list_len - 1);
+
+        // Emit an empty array if not valid post-adjustment
+        if start > stop {
+            socket.write_all(b"*0\r\n").await.unwrap();
+            return;
+        }
+
+        // Build bulk string
+        let range_size = stop - start + 1;
+        let mut bulk_str = format!("*{}\r\n", range_size);
+        for val in val_list.iter().skip(start as usize).take(range_size as usize) {
+            bulk_str.push_str(&format!("${}\r\n{}\r\n", val.len(), val));
+        }
+
+        socket.write_all(bulk_str.as_bytes()).await.unwrap();
+    } // Emit an error message if value is of the wrong type
+    else {
+        socket.write_all(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n").await.unwrap();
+    };
 }
 
 async fn cmd_other(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
@@ -148,7 +233,8 @@ async fn cmd_other(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     socket.write_all(err_str.as_bytes()).await.unwrap();
 }
 
-async fn process_cmd(cmd: &[u8], socket: &mut TcpStream, pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+async fn process_cmd(cmd: &[u8], socket: &mut TcpStream,
+                     pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     let parsed_cmd: Vec<String> = resp_parse(cmd).await;
 
     // Handle by command
@@ -158,6 +244,7 @@ async fn process_cmd(cmd: &[u8], socket: &mut TcpStream, pairs: &Arc<Mutex<HashM
         "SET" => cmd_set(&parsed_cmd, socket, pairs).await,
         "GET" => cmd_get(&parsed_cmd, socket, pairs).await,
         "RPUSH" => cmd_rpush(&parsed_cmd, socket, pairs).await,
+        "LRANGE" => cmd_lrange(&parsed_cmd, socket, pairs).await,
         _ => cmd_other(&parsed_cmd, socket).await
     }
 }
