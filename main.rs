@@ -225,6 +225,29 @@ async fn cmd_lrange(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
     };
 }
 
+async fn cmd_llen(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                  pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+    if parsed_cmd.len() != 2 {
+        socket.write_all(b"-ERR wrong number of arguments for 'llen' command").await.unwrap();
+        return;
+    }
+
+    let val_list_len = match pairs.lock().await.get_mut(&parsed_cmd[1]) {
+        // No such key is found (=> no string list)
+        None => 0,
+        // An existing string list is found
+        Some(Value::ValStringList(val_list)) => val_list.len(),
+        // Value is of the wrong type
+        Some(_) => {
+            socket.write_all(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n").await.unwrap();
+            return;
+        }
+    };
+
+    // Emit the list's length
+    socket.write_all(format!(":{}\r\n", val_list_len).as_bytes()).await.unwrap();
+}
+
 async fn cmd_other(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     // Build error string
     let mut err_str = format!("-ERR unknown command `{}`, with args beginning with: ", parsed_cmd[0]);
@@ -233,6 +256,7 @@ async fn cmd_other(parsed_cmd: &Vec<String>, socket: &mut TcpStream) {
     }
     err_str.push_str("\r\n");
 
+    // Emit the string
     socket.write_all(err_str.as_bytes()).await.unwrap();
 }
 
@@ -249,6 +273,7 @@ async fn process_cmd(cmd: &[u8], socket: &mut TcpStream,
         "RPUSH" => cmd_push(true, &parsed_cmd, socket, pairs).await,
         "LPUSH" => cmd_push(false, &parsed_cmd, socket, pairs).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, socket, pairs).await,
+        "LLEN" => cmd_llen(&parsed_cmd, socket, pairs).await,
         _ => cmd_other(&parsed_cmd, socket).await
     }
 }
