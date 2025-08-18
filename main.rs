@@ -131,7 +131,8 @@ async fn cmd_get(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
 async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, socket: &mut TcpStream,
                   pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     if parsed_cmd.len() < 3 {
-        socket.write_all(b"-ERR wrong number of arguments for 'rpush' command\r\n").await.unwrap();
+        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
+        socket.write_all(err_str.as_bytes()).await.unwrap();
         return;
     }
 
@@ -161,6 +162,68 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, socket: &mut TcpSt
     socket.write_all(format!(":{}\r\n", val_list_len).as_bytes()).await.unwrap();
 }
 
+async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, socket: &mut TcpStream,
+                 pairs: &Arc<Mutex<HashMap<String, Value>>>) {
+    let args_len = parsed_cmd.len();
+    if args_len != 2 && args_len != 3 {
+        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
+        socket.write_all(err_str.as_bytes()).await.unwrap();
+        return;
+    }
+
+    let key = &parsed_cmd[1];
+    // Get number of pops based on args length
+    let pop_num = match args_len {
+        2 => 1,
+        3 => match str_to_i32(&parsed_cmd[2], |val| val).await {
+                // 0 or positive number
+                Some(v) if v >= 0 => v,
+                // Negative number / not parseable
+                Some(_) | None => {
+                    socket.write_all(b"-ERR value is out of range, must be positive\r\n").await.unwrap();
+                    return;
+                }
+             }
+        _ => 0
+    };
+    
+    let mut guard = pairs.lock().await;
+    // Return (nil) if no such key is found
+    if !guard.contains_key(key) {
+        socket.write_all(b"$-1\r\n").await.unwrap();
+        return;
+    } // Pop values from an existing string list if found
+    else if let Some(Value::ValStringList(val_list)) = guard.get_mut(key) {
+        // Clamp number of pops and set L/R functionality
+        let pop_num_usize: usize = min(pop_num as usize, val_list.len());
+        let mut pop = || if from_right { val_list.pop_back() } else { val_list.pop_front() };
+
+        // Pop & build bulk string
+        let bulk_str = match pop_num_usize {
+            1 => match pop() {
+                    Some(v) => format!("+{}\r\n", v),
+                    None => return
+                 },
+            _ => format!("*{}\r\n{}", pop_num_usize,
+                    (0..pop_num_usize) // For [pop_num_usize] times
+                        .filter_map(|_| pop()) // Pop, filter & map popped values
+                        .map(|val| format!("${}\r\n{}\r\n", val.len(), val)) // Stringify each value
+                        .collect::<String>()) // Unify to one string)
+        };
+
+        socket.write_all(bulk_str.as_bytes()).await.unwrap();
+
+        // Remove key if popped all values
+        if pop_num_usize == val_list.len() {
+            guard.remove(key);
+        }
+    } // Emit an error message if value is of the wrong type
+    else {
+        socket.write_all(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n").await.unwrap();
+        return;
+    };
+}
+
 async fn cmd_lrange(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
                     pairs: &Arc<Mutex<HashMap<String, Value>>>) {
     if parsed_cmd.len() != 4 {
@@ -170,18 +233,14 @@ async fn cmd_lrange(parsed_cmd: &Vec<String>, socket: &mut TcpStream,
 
     // Extract key, start and stop args
     let key = &parsed_cmd[1];
-    let mut start = match str_to_i32(&parsed_cmd[2],
-        |val| val
-    ).await {
+    let mut start = match str_to_i32(&parsed_cmd[2], |val| val).await {
         Some(v) => v,
         None => {
             socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
             return;
         }
     };
-    let mut stop = match str_to_i32(&parsed_cmd[3],
-        |val| val
-    ).await {
+    let mut stop = match str_to_i32(&parsed_cmd[3], |val| val).await {
         Some(v) => v,
         None => {
             socket.write_all(b"-ERR value is not an integer or out of range\r\n").await.unwrap();
@@ -272,6 +331,8 @@ async fn process_cmd(cmd: &[u8], socket: &mut TcpStream,
         "GET" => cmd_get(&parsed_cmd, socket, pairs).await,
         "RPUSH" => cmd_push(true, &parsed_cmd, socket, pairs).await,
         "LPUSH" => cmd_push(false, &parsed_cmd, socket, pairs).await,
+        "RPOP" => cmd_pop(true, &parsed_cmd, socket, pairs).await,
+        "LPOP" => cmd_pop(false, &parsed_cmd, socket, pairs).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, socket, pairs).await,
         "LLEN" => cmd_llen(&parsed_cmd, socket, pairs).await,
         _ => cmd_other(&parsed_cmd, socket).await
