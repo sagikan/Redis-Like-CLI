@@ -8,7 +8,7 @@ use tokio::sync::MutexGuard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
-use crate::db::{ValueType, Client, Value, Database, BlockedClients};
+use crate::db::{get_next_id, ValueType, Client, BlockedClient, Value, Database, BlockedClients};
 
 fn resp_parse(to_parse: &[u8]) -> Vec<String> {
     let unparsed_str = std::str::from_utf8(to_parse).unwrap();
@@ -40,6 +40,13 @@ fn extract_str(value: &Value) -> Option<String> {
 
 fn str_to_i32<FOk: Fn(i32) -> i32>(to_parse: &String, ok_logic: FOk) -> Option<i32> {
     match to_parse.parse::<i32>() {
+        Ok(val) => Some(ok_logic(val)),
+        Err(_) => None
+    }
+}
+
+fn str_to_f64<FOk: Fn(f64) -> f64>(to_parse: &String, ok_logic: FOk) -> Option<f64> {
+    match to_parse.parse::<f64>() {
         Ok(val) => Some(ok_logic(val)),
         Err(_) => None
     }
@@ -142,38 +149,83 @@ async fn cmd_get(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{}\r\n", val).as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
+                  db: Database, blocked_clients: BlockedClients) {
     if parsed_cmd.len() < 3 {
         let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
         client.tx.send(err_str.as_bytes().to_vec()).unwrap();
         return;
     }
 
+    // Extract key and values
     let key = &parsed_cmd[1];
+    let mut val_list: VecDeque<String> = parsed_cmd[2..].iter().cloned().collect();
+    let val_list_len = val_list.len();
+
+    {
+        let mut blocked_clients_guard = blocked_clients.lock().await;
+        let mut to_unblock = Vec::new();
+        // Look for blocked clients waiting for push
+        if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
+            let pop_num = min(val_list.len(), blocked_list.len());
+            for _ in 0..pop_num {
+                let front_client = blocked_list.pop_front().unwrap();
+                // Extract value based on [R\L]PUSH and client's B[R\L]POP
+                let val = match (from_right, front_client.from_right) {
+                    (true, true) | (false, false) => val_list.pop_back().unwrap(),
+                    (true, false) | (false, true) => val_list.pop_front().unwrap()
+                };
+
+                // Emit to front_client an array of key + popped value
+                front_client.client.tx.send(format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                                    key.len(), key, val.len(), val).as_bytes().to_vec()).unwrap();
+                
+                to_unblock.push(front_client);
+            }
+        }
+
+        // Unblock clients from all keys attached to their BPOP command
+        for blocked_client in to_unblock {
+            for key in &blocked_client.blocked_by {
+                if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
+                    blocked_list.retain(|bc| bc.client.id != blocked_client.client.id);
+                }
+            }
+        }
+    }
+
+    // Get updated number of values to push
+    let upd_val_list_len = val_list.len();
     
     let mut guard = db.lock().await;
     // Create and insert string list if no such key is found
-    let val_list_len = if !guard.contains_key(key) {
-        let val_list: VecDeque<String> = parsed_cmd[2..].iter().cloned().collect();
-        let val_list_len = val_list.len(); // Avoids moving & cloning val_list
-        let value = Value {
-            val: ValueType::StringList(val_list),
-            expiry: None
-        };
-        guard.insert(key.clone(), value);
-        val_list_len
-    }
-    else {
+    let stored_val_list_len = if !guard.contains_key(key) {
+        // Insert if there are still values to push
+        if upd_val_list_len > 0 {
+            let value = Value {
+                val: ValueType::StringList(val_list),
+                expiry: None
+            };
+            guard.insert(key.clone(), value);
+        }
+
+        val_list_len // Return OG length
+    } else {
         let value = guard.get_mut(key).unwrap();
         match &mut value.val {
-            // An existing string list if found
-            ValueType::StringList(val_list) => {
-                // Insert values
-                match from_right {
-                    true => val_list.extend(parsed_cmd[2..].iter().cloned()),
-                    false => for val in parsed_cmd[2..].iter() { val_list.push_front(val.clone()); }
+            // An existing string list is found
+            ValueType::StringList(stored_val_list) => {
+                // Insert if there are still values to push
+                if val_list_len > 0 {
+                    match from_right {
+                        true => stored_val_list.extend(val_list),
+                        false => while let Some(val) = val_list.pop_front() {
+                            stored_val_list.push_front(val);
+                        }
+                    }
                 }
-                val_list.len()
+
+                stored_val_list.len()
             }, // Value is of the wrong type
             _ => {
                 client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
@@ -181,9 +233,9 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, d
             }
         }
     };
-
+    
     // Emit the list's length
-    client.tx.send(format!(":{}\r\n", val_list_len).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{}\r\n", stored_val_list_len).as_bytes().to_vec()).unwrap();
 }
 
 async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db: Database) {
@@ -220,7 +272,8 @@ async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db
         // An existing string list is found
         ValueType::StringList(val_list) => {
             // Clamp number of pops and set L/R functionality
-            let pop_num_usize: usize = min(pop_num as usize, val_list.len());
+            let val_list_len = val_list.len();
+            let pop_num_usize: usize = min(pop_num as usize, val_list_len);
             let mut pop = || if from_right { val_list.pop_back() } else { val_list.pop_front() };
 
             // Pop & build bulk string
@@ -239,9 +292,97 @@ async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db
             client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
 
             // Remove key if popped all values
-            if pop_num_usize == val_list.len() { guard.remove(key); }
+            if pop_num_usize == val_list_len { guard.remove(key); }
         }, // Value is of the wrong type
         _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+    }
+}
+
+async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
+                  db: Database, blocked_clients: BlockedClients) {
+    let args_len = parsed_cmd.len();
+    if args_len < 3 {
+        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
+        client.tx.send(err_str.as_bytes().to_vec()).unwrap();
+        return;
+    }
+
+    // Extract keys
+    let keys: Vec<String> = parsed_cmd[1..args_len-1].to_vec();
+
+    // Try immediate pop
+    {
+        let mut guard = db.lock().await;
+        for key in &keys {
+            // Skip 
+            if !guard.contains_key(key) { continue; }
+
+            let value = guard.get_mut(key).unwrap();
+            let val: String = match &mut value.val {
+                // An existing string list is found
+                ValueType::StringList(val_list) =>
+                    match from_right {
+                        true => val_list.pop_back().unwrap(),
+                        false => val_list.pop_front().unwrap()
+                    },
+                // Value is of the wrong type
+                _ => {
+                    client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                    return;
+                }
+            };
+
+            // Emit key + popped value array
+            client.tx.send(format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                                   key.len(), key, val.len(), val)
+                           .as_bytes().to_vec()).unwrap();
+            return;
+        }
+    }
+
+    // All keys are empty => add client to every blocked list
+    {
+        let mut blocked_clients_guard = blocked_clients.lock().await;
+        for key in &keys {
+            blocked_clients_guard
+                .entry(key.clone()) // Get entry of key if exists
+                .or_insert_with(VecDeque::new) // If not, create an empty list
+                .push_back(BlockedClient { // Push client to end of list
+                    client: client.clone(),
+                    from_right,
+                    blocked_by: keys.clone()
+                });
+        }
+    }
+
+    // Extract timeout
+    let timeout = match str_to_f64(&parsed_cmd[args_len-1], |val| val) {
+        Some(v) if v >= 0.0 => v, // 0 or positive number
+        _ => { // Negative number / not parseable
+            client.tx.send(b"-ERR timeout is negative\r\n".to_vec()).unwrap();
+            return;
+        }
+    };
+
+    // Handle non-zero timeout via Tokio-runtime
+    if timeout > 0.0 {
+        let tokio_client = client.clone();
+        let tokio_blocked_clients = blocked_clients.clone();
+        let tokio_keys = keys.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs_f64(timeout)).await;
+
+            let mut blocked_clients_guard = tokio_blocked_clients.lock().await;
+            // Client is still blocked by some list (=> haven't popped yet)
+            if tokio_keys.iter().any(|key|
+                if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
+                    blocked_list.iter().any(|bc| bc.client.id == tokio_client.id)
+                } else { false }
+            ) {
+                // Emit (nil)
+                tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap();
+            }
+        });
     }
 }
 
@@ -351,10 +492,12 @@ async fn process_cmd(cmd: &[u8], client: &Client,
         "ECHO" => cmd_echo(&parsed_cmd, &client),
         "SET" => cmd_set(&parsed_cmd, &client, db).await,
         "GET" => cmd_get(&parsed_cmd, &client, db).await,
-        "RPUSH" => cmd_push(true, &parsed_cmd, &client, db).await,
-        "LPUSH" => cmd_push(false, &parsed_cmd, &client, db).await,
+        "RPUSH" => cmd_push(true, &parsed_cmd, &client, db, blocked_clients).await,
+        "LPUSH" => cmd_push(false, &parsed_cmd, &client, db, blocked_clients).await,
         "RPOP" => cmd_pop(true, &parsed_cmd, &client, db).await,
         "LPOP" => cmd_pop(false, &parsed_cmd, &client, db).await,
+        "BRPOP" => cmd_bpop(true, &parsed_cmd, &client, db, blocked_clients).await,
+        "BLPOP" => cmd_bpop(false, &parsed_cmd, &client, db, blocked_clients).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, &client, db).await,
         "LLEN" => cmd_llen(&parsed_cmd, &client, db).await,
         _ => cmd_other(&parsed_cmd, &client)
@@ -363,19 +506,18 @@ async fn process_cmd(cmd: &[u8], client: &Client,
 
 #[tokio::main]
 async fn main() {
-    // Set listener to port 6379
+    // Set listener to port 6379 + maps
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let db = Database::default();
     let blocked_clients = BlockedClients::default();
     
     // Event loop
     loop {
-        // Accept client (blocking)
+        // Accept client
         let (socket, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = socket.into_split();
-        // Open channel and init Client object
         let (tx, mut rx) = unbounded_channel();
-        let client = Client { tx };
+        let client = Client { id: get_next_id(), tx };
 
         // Tokio-runtime write task
         tokio::spawn(async move {
