@@ -470,6 +470,24 @@ async fn cmd_llen(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!(":{}\r\n", val_list_len).as_bytes().to_vec()).unwrap();
 }
 
+async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+    if parsed_cmd.len() != 2 {
+        client.tx.send(b"-ERR wrong number of arguments for 'type' command\r\n".to_vec()).unwrap();
+        return;
+    }
+    
+    let val_type = match db.lock().await.get(&parsed_cmd[1]) {
+        Some(value) => match &value.val {
+            ValueType::String(_) => "string",
+            ValueType::StringList(_) => "list",
+            _ => "none"
+        },
+        None => "none"
+    };
+
+    client.tx.send(format!("+{}\r\n", val_type).as_bytes().to_vec()).unwrap();
+}
+
 fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
     // Build error string
     let mut err_str = format!("-ERR unknown command `{}`, with args beginning with: ", parsed_cmd[0]);
@@ -500,6 +518,7 @@ async fn process_cmd(cmd: &[u8], client: &Client,
         "BLPOP" => cmd_bpop(false, &parsed_cmd, &client, db, blocked_clients).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, &client, db).await,
         "LLEN" => cmd_llen(&parsed_cmd, &client, db).await,
+        "TYPE" => cmd_type(&parsed_cmd, &client, db).await,
         _ => cmd_other(&parsed_cmd, &client)
     }
 }
