@@ -52,9 +52,9 @@ fn set_pair(key: String, value: Value, client: &Client,
     client.tx.send(b"+OK\r\n".to_vec()).unwrap();
 }
 
-async fn validate_entry_id(db: Database, stream_key: &String, entry_id: &String,
-                           client: &Client) -> Option<EntryIdType> {
-    if entry_id == "*" { // Full auto-gen
+async fn validate_added_entry_id(db: Database, stream_key: &String, entry_id: &String,
+                                 client: &Client) -> Option<EntryIdType> {
+    if entry_id == "*" { // Full
         return Some(EntryIdType::Full(()));
     }
     
@@ -63,41 +63,70 @@ async fn validate_entry_id(db: Database, stream_key: &String, entry_id: &String,
         None
     };
 
+    // Parse + validate
     match entry_id.split_once('-') {
         Some((ms_time, seq_num)) => {
-            if let Ok(ms_time) = ms_time.parse::<u64>() {
-                if let Ok(seq_num) = seq_num.parse::<u64>() { // Explicit
-                    // Invalidate if 0-0 / not sequential to last entry
+            match (ms_time.parse::<u64>(), seq_num.parse::<u64>()) {
+                (Ok(ms_time), Ok(seq_num)) => { // Explicit
+                    // Invalidate 0-0
                     if (ms_time, seq_num) == (0, 0) {
                         invalid_id(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
                     } else if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+                        // Invalidate if not sequential to last entry
                         if ms_time < last_entry.ms_time || (ms_time == last_entry.ms_time && seq_num <= last_entry.seq_num) {
                             invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
-                        } else {
-                            Some(EntryIdType::Explicit((ms_time, seq_num)))
-                        }
-                    } else {
-                        Some(EntryIdType::Explicit((ms_time, seq_num)))
-                    }
-                } else if seq_num == "*" { // Partial auto-gen
+                        } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
+                    } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
+                }, (Ok(ms_time), _) if seq_num == "*" => { // Partial
                     // Invalidate if ms_time is not sequential to last entry
                     if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
                         if ms_time < last_entry.ms_time {
                             invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
-                        } else {
-                            Some(EntryIdType::Partial(ms_time))
-                        }
-                    } else {
-                        Some(EntryIdType::Partial(ms_time))
-                    }
-                } else {
-                    invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
-                }
-            } else {
-                invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+                        } else { Some(EntryIdType::Partial(ms_time)) }
+                    } else { Some(EntryIdType::Partial(ms_time)) }
+                }, _ => invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
             }
         }, None => invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
     }
+}
+
+async fn validate_ranged_entry_id(is_start: bool, entry_id: &String,
+                                  client: &Client) -> Option<EntryIdType> {
+    if (is_start && entry_id == "-") || (!is_start && entry_id == "+") { // Full
+        return Some(EntryIdType::Full(()));
+    }
+
+    let invalid_id = || {
+        client.tx.send(b"-ERR Invalid stream ID specified as stream command argument\r\n".to_vec()).unwrap();
+        None
+    };
+
+    // Parse + validate
+    match entry_id.split_once('-') {
+        Some((ms_time, seq_num)) => { // Explicit
+            match (ms_time.parse::<u64>(), seq_num.parse::<u64>()) {
+                (Ok(ms_time), Ok(seq_num)) => Some(EntryIdType::Explicit((ms_time, seq_num))),
+                _ => invalid_id()
+            }
+        }, None => { // Partial
+            match entry_id.parse::<u64>() {
+                Ok(ms_time) => Some(EntryIdType::Partial(ms_time)),
+                _ => invalid_id()
+            }
+        }
+    }
+}
+
+async fn get_first_entry(db: Database, stream_key: &String) -> Option<Entry> {
+    if let Some(value) = db.lock().await.get_mut(stream_key) {
+        if let ValueType::Stream(stream) = &value.val {
+            if let Some(first_entry) = stream.entries.lock().await.front() {
+                return Some(first_entry.clone());
+            }
+        }
+    }
+
+    None
 }
 
 async fn get_last_entry(db: Database, stream_key: &String) -> Option<Entry> {
@@ -105,6 +134,19 @@ async fn get_last_entry(db: Database, stream_key: &String) -> Option<Entry> {
         if let ValueType::Stream(stream) = &value.val {
             if let Some(last_entry) = stream.entries.lock().await.back() {
                 return Some(last_entry.clone());
+            }
+        }
+    }
+
+    None
+}
+
+async fn get_last_seq_entry(db: Database, stream_key: &String, ms_time: u64) -> Option<Entry> {
+    if let Some(value) = db.lock().await.get_mut(stream_key) {
+        if let ValueType::Stream(stream) = &value.val {
+            // Iteration from the right assures max sequenced entry
+            if let Some(entry) = stream.entries.lock().await.iter().rfind(|e| e.ms_time == ms_time) {
+                return Some(entry.clone());
             }
         }
     }
@@ -573,8 +615,8 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
 
     // Extract stream key, entry ID (+ validate, automate), and fields
     let stream_key = &parsed_cmd[1];
-    let (ms_time, seq_num) = match validate_entry_id(db.clone(), &stream_key,
-                                                     &parsed_cmd[2], &client).await
+    let (ms_time, seq_num) = match validate_added_entry_id(db.clone(), &stream_key,
+                                                           &parsed_cmd[2], &client).await
     {
         Some(EntryIdType::Full(_)) => {
             let ms = gen_ms();
@@ -625,6 +667,88 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("${}\r\n{}\r\n", entry_id.len(), entry_id).as_bytes().to_vec()).unwrap();
 }
 
+async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+    if parsed_cmd.len() != 4 {
+        client.tx.send(b"-ERR wrong number of arguments for 'xrange' command\r\n".to_vec()).unwrap();
+        return;
+    }
+
+    // Extract key + start, end entry IDs
+    let stream_key = &parsed_cmd[1];
+    let (s_ms_time, s_seq_num) = match validate_ranged_entry_id(true, &parsed_cmd[2], &client).await {
+        Some(EntryIdType::Full(_)) => { // Entry ID is '-'
+            match get_first_entry(db.clone(), &stream_key).await {
+                Some(e) => (e.ms_time, e.seq_num),
+                None => { // No entries
+                    client.tx.send(b"*0\r\n".to_vec()).unwrap();
+                    return;
+                }
+            }
+        },
+        Some(EntryIdType::Partial(ms)) => (ms, 0),
+        Some(EntryIdType::Explicit((ms, seq))) => (ms, seq),
+        None => return
+    };
+    let (e_ms_time, e_seq_num) = match validate_ranged_entry_id(false, &parsed_cmd[3], &client).await {
+        Some(EntryIdType::Full(_)) => { // Entry ID is '+'
+            match get_last_entry(db.clone(), &stream_key).await {
+                Some(e) => (e.ms_time, e.seq_num),
+                None => { // No entries
+                    client.tx.send(b"*0\r\n".to_vec()).unwrap();
+                    return;
+                }
+            }
+        },
+        Some(EntryIdType::Partial(ms)) => {
+            // Set with the max seq_num of ms
+            let seq = match get_last_seq_entry(db.clone(), &stream_key, ms).await {
+                Some(e) => e.seq_num,
+                None if ms > 0 => 0,
+                _ => 1
+            };
+            (ms, seq)
+        },
+        Some(EntryIdType::Explicit((ms, seq))) => (ms, seq),
+        None => return
+    };
+
+    // Emit an empty array if range not sequential
+    if s_ms_time > e_ms_time || (s_ms_time == e_ms_time && s_seq_num > e_seq_num) {
+        client.tx.send(b"*0\r\n".to_vec()).unwrap();
+        return;
+    }
+
+    if let Some(value) = db.lock().await.get_mut(stream_key) {
+        match &value.val {
+            // An existing stream is found
+            ValueType::Stream(stream) => {
+                // Filter entries based on range
+                let ranged: Vec<Entry> = stream.entries.lock().await.iter().filter(
+                    |e| s_ms_time <= e.ms_time && e_ms_time >= e.ms_time &&
+                        s_seq_num <= e.seq_num && e_seq_num >= e.seq_num
+                ).cloned().collect();
+                
+                // Build + emit bulk string
+                let mut bulk_str = String::new();
+                bulk_str.push_str(&format!("*{}\r\n", ranged.len()));
+                // Iterate over entries
+                for e in ranged {
+                    let e_id = format!("{}-{}", e.ms_time, e.seq_num);
+                    bulk_str.push_str(&format!("*2\r\n${}\r\n{e_id}\r\n*{}\r\n", e_id.len(), e.fields.len() * 2));
+                    // Iterate over entry's fields
+                    for (key, val) in e.fields.iter() {
+                        bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()));
+                    }
+                }
+
+                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+            },
+            // Value is of the wrong type
+            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+        }
+    }
+}
+
 fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
     // Build error string
     let mut err_str = format!("-ERR unknown command `{}`, with args beginning with: ", parsed_cmd[0]);
@@ -637,8 +761,8 @@ fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
     client.tx.send(err_str.as_bytes().to_vec()).unwrap();
 }
 
-async fn process_cmd(cmd: &[u8], client: &Client,
-                     db: Database, blocked_clients: BlockedClients) {
+async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
+                     blocked_clients: BlockedClients) {
     let parsed_cmd: Vec<String> = resp_parse(cmd);
 
     // Handle by command
@@ -657,6 +781,7 @@ async fn process_cmd(cmd: &[u8], client: &Client,
         "LLEN"   => cmd_llen(&parsed_cmd, &client, db).await,
         "TYPE"   => cmd_type(&parsed_cmd, &client, db).await,
         "XADD"   => cmd_xadd(&parsed_cmd, &client, db).await,
+        "XRANGE" => cmd_xrange(&parsed_cmd, &client, db).await,
         _        => cmd_other(&parsed_cmd, &client)
     }
 }
