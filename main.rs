@@ -2,13 +2,14 @@
 mod db;
 use std::collections::{VecDeque, HashMap};
 use std::cmp::min;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::MutexGuard;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
-use crate::db::{get_next_id, ValueType, Client, BlockedClient, Value, Database, BlockedClients};
+use crate::db::*;
 
 fn resp_parse(to_parse: &[u8]) -> Vec<String> {
     let unparsed_str = std::str::from_utf8(to_parse).unwrap();
@@ -31,13 +32,6 @@ fn resp_parse(to_parse: &[u8]) -> Vec<String> {
     parsed
 }
 
-fn extract_str(value: &Value) -> Option<String> {
-    match &value.val {
-        ValueType::String(str_val) => Some(str_val.clone()),
-        _ => None
-    }
-}
-
 fn str_to_i32<FOk: Fn(i32) -> i32>(to_parse: &String, ok_logic: FOk) -> Option<i32> {
     match to_parse.parse::<i32>() {
         Ok(val) => Some(ok_logic(val)),
@@ -56,6 +50,87 @@ fn set_pair(key: String, value: Value, client: &Client,
                   mut guard: MutexGuard<'_, HashMap<String, Value>>) {
     guard.insert(key, value);
     client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+}
+
+async fn validate_entry_id(db: Database, stream_key: &String, entry_id: &String,
+                           client: &Client) -> Option<EntryIdType> {
+    if entry_id == "*" { // Full auto-gen
+        return Some(EntryIdType::Full(()));
+    }
+    
+    let invalid_id = |msg: &[u8]| {
+        client.tx.send(msg.to_vec()).unwrap();
+        None
+    };
+
+    match entry_id.split_once('-') {
+        Some((ms_time, seq_num)) => {
+            if let Ok(ms_time) = ms_time.parse::<u64>() {
+                if let Ok(seq_num) = seq_num.parse::<u64>() { // Explicit
+                    // Invalidate if 0-0 / not sequential to last entry
+                    if (ms_time, seq_num) == (0, 0) {
+                        invalid_id(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+                    } else if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+                        if ms_time < last_entry.ms_time || (ms_time == last_entry.ms_time && seq_num <= last_entry.seq_num) {
+                            invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                        } else {
+                            Some(EntryIdType::Explicit((ms_time, seq_num)))
+                        }
+                    } else {
+                        Some(EntryIdType::Explicit((ms_time, seq_num)))
+                    }
+                } else if seq_num == "*" { // Partial auto-gen
+                    // Invalidate if ms_time is not sequential to last entry
+                    if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+                        if ms_time < last_entry.ms_time {
+                            invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                        } else {
+                            Some(EntryIdType::Partial(ms_time))
+                        }
+                    } else {
+                        Some(EntryIdType::Partial(ms_time))
+                    }
+                } else {
+                    invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+                }
+            } else {
+                invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+            }
+        }, None => invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+    }
+}
+
+async fn get_last_entry(db: Database, stream_key: &String) -> Option<Entry> {
+    if let Some(value) = db.lock().await.get_mut(stream_key) {
+        if let ValueType::Stream(stream) = &value.val {
+            if let Some(last_entry) = stream.entries.lock().await.back() {
+                return Some(last_entry.clone());
+            }
+        }
+    }
+
+    None
+}
+
+fn gen_ms() -> u64 {
+    // Return the current UNIX time in ms
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(t) => t.as_millis() as u64,
+        Err(_) => panic!("You're a time traveller, Harry!")
+    }
+}
+
+async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
+    if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+        // Same ms_time => Inc. seq_num
+        if ms_time == last_entry.ms_time { last_entry.seq_num + 1 }
+        // New ms_time (> last entry's as previously validated) => New sequence
+        else { 0 }
+    } else if ms_time > 0 { // Empty stream, non-zero ms_time => New sequence
+        0
+    } else { // Empty stream, ms_time = 0 => New sequence starting at 1
+        1
+    }
 }
 
 fn cmd_echo(parsed_cmd: &Vec<String>, client: &Client) {
@@ -138,9 +213,9 @@ async fn cmd_get(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
 
     // Extract + emit value
     let value: Value = guard.get(key).unwrap().clone();
-    let val: String = match extract_str(&value) {
-        Some(str_val) => str_val,
-        None => {
+    let val = match &value.val {
+        ValueType::String(val) => val,
+        _ => {
             eprintln!("Extraction Error");
             return;
         }
@@ -480,12 +555,74 @@ async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         Some(value) => match &value.val {
             ValueType::String(_) => "string",
             ValueType::StringList(_) => "list",
+            ValueType::Stream(_) => "stream",
             _ => "none"
         },
         None => "none"
     };
 
     client.tx.send(format!("+{}\r\n", val_type).as_bytes().to_vec()).unwrap();
+}
+
+async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+    let args_len = parsed_cmd.len();
+    if args_len < 5 || args_len % 2 == 0 {
+        client.tx.send(b"-ERR wrong number of arguments for 'xadd' command\r\n".to_vec()).unwrap();
+        return;
+    }
+
+    // Extract stream key, entry ID (+ validate, automate), and fields
+    let stream_key = &parsed_cmd[1];
+    let (ms_time, seq_num) = match validate_entry_id(db.clone(), &stream_key,
+                                                     &parsed_cmd[2], &client).await
+    {
+        Some(EntryIdType::Full(_)) => {
+            let ms = gen_ms();
+            let seq = gen_seq(db.clone(), &stream_key, ms).await;
+            (ms, seq)
+        }, Some(EntryIdType::Partial(ms)) => {
+            let seq = gen_seq(db.clone(), &stream_key, ms).await;
+            (ms, seq)
+        }, Some(EntryIdType::Explicit((ms, seq))) => (ms, seq),
+        None => return
+    };
+    let mut map = HashMap::new();
+    for i in (3..args_len).step_by(2) {
+        map.insert(parsed_cmd[i].clone(), parsed_cmd[i+1].clone());
+    }
+    let fields: Fields = Arc::new(map);
+
+    // Create entry
+    let entry = Entry {
+        ms_time: ms_time.clone(),
+        seq_num: seq_num.clone(),
+        fields
+    };
+
+    let mut guard = db.lock().await;
+    // Insert entry to stream
+    if let Some(value) = guard.get_mut(stream_key) {
+        match &value.val {
+            // An existing stream is found
+            ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
+            // Value is of the wrong type
+            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+        }
+    } else {
+        let entries = Entries::default();
+        // Insert entry + create stream
+        entries.lock().await.push_back(entry);
+        let stream = Value {
+            val: ValueType::Stream(Stream { entries }),
+            expiry: None
+        };
+        // Insert stream
+        guard.insert(stream_key.clone(), stream);
+    }
+
+    // Emit the entry ID
+    let entry_id = format!("{ms_time}-{seq_num}");
+    client.tx.send(format!("${}\r\n{}\r\n", entry_id.len(), entry_id).as_bytes().to_vec()).unwrap();
 }
 
 fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
@@ -506,20 +643,21 @@ async fn process_cmd(cmd: &[u8], client: &Client,
 
     // Handle by command
     match parsed_cmd[0].to_uppercase().as_str() {
-        "PING" => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
-        "ECHO" => cmd_echo(&parsed_cmd, &client),
-        "SET" => cmd_set(&parsed_cmd, &client, db).await,
-        "GET" => cmd_get(&parsed_cmd, &client, db).await,
-        "RPUSH" => cmd_push(true, &parsed_cmd, &client, db, blocked_clients).await,
-        "LPUSH" => cmd_push(false, &parsed_cmd, &client, db, blocked_clients).await,
-        "RPOP" => cmd_pop(true, &parsed_cmd, &client, db).await,
-        "LPOP" => cmd_pop(false, &parsed_cmd, &client, db).await,
-        "BRPOP" => cmd_bpop(true, &parsed_cmd, &client, db, blocked_clients).await,
-        "BLPOP" => cmd_bpop(false, &parsed_cmd, &client, db, blocked_clients).await,
+        "PING"   => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
+        "ECHO"   => cmd_echo(&parsed_cmd, &client),
+        "SET"    => cmd_set(&parsed_cmd, &client, db).await,
+        "GET"    => cmd_get(&parsed_cmd, &client, db).await,
+        "RPUSH"  => cmd_push(true, &parsed_cmd, &client, db, blocked_clients).await,
+        "LPUSH"  => cmd_push(false, &parsed_cmd, &client, db, blocked_clients).await,
+        "RPOP"   => cmd_pop(true, &parsed_cmd, &client, db).await,
+        "LPOP"   => cmd_pop(false, &parsed_cmd, &client, db).await,
+        "BRPOP"  => cmd_bpop(true, &parsed_cmd, &client, db, blocked_clients).await,
+        "BLPOP"  => cmd_bpop(false, &parsed_cmd, &client, db, blocked_clients).await,
         "LRANGE" => cmd_lrange(&parsed_cmd, &client, db).await,
-        "LLEN" => cmd_llen(&parsed_cmd, &client, db).await,
-        "TYPE" => cmd_type(&parsed_cmd, &client, db).await,
-        _ => cmd_other(&parsed_cmd, &client)
+        "LLEN"   => cmd_llen(&parsed_cmd, &client, db).await,
+        "TYPE"   => cmd_type(&parsed_cmd, &client, db).await,
+        "XADD"   => cmd_xadd(&parsed_cmd, &client, db).await,
+        _        => cmd_other(&parsed_cmd, &client)
     }
 }
 

@@ -12,10 +12,42 @@ pub fn get_next_id() -> u64 {
     CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+// pub fn is_expired(value: &Value) -> bool {
+//     value.expiry.map_or(false, |e| Instant::now() >= e)
+// }
+
+pub type Fields = Arc<HashMap<String, String>>;
+
+pub type Entries = Arc<Mutex<VecDeque<Entry>>>;
+
+pub type Database = Arc<Mutex<HashMap<String, Value>>>;
+
+pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
+
 #[derive(Clone)]
 pub enum ValueType {
     String(String),
-    StringList(VecDeque<String>)
+    StringList(VecDeque<String>),
+    Stream(Stream)
+}
+
+#[derive(Clone)]
+pub enum EntryIdType {
+    Full(()),
+    Partial(u64),
+    Explicit((u64, u64))
+}
+
+#[derive(Clone)]
+pub struct Entry {
+    pub ms_time: u64,
+    pub seq_num: u64,
+    pub fields: Fields
+}
+
+#[derive(Clone)]
+pub struct Stream {
+    pub entries: Entries
 }
 
 #[derive(Clone)]
@@ -24,6 +56,7 @@ pub struct Client {
     pub tx: UnboundedSender<Vec<u8>>
 }
 
+#[derive(Clone)]
 pub struct BlockedClient {
     pub client: Client,
     pub from_right: bool,
@@ -35,11 +68,3 @@ pub struct Value {
     pub val: ValueType,
     pub expiry: Option<Instant>
 }
-
-// pub fn is_expired(value: &Value) -> bool {
-//     value.expiry.map_or(false, |e| Instant::now() >= e)
-// }
-
-pub type Database = Arc<Mutex<HashMap<String, Value>>>;
-
-pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
