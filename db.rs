@@ -12,10 +12,6 @@ pub fn get_next_id() -> u64 {
     CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-// pub fn is_expired(value: &Value) -> bool {
-//     value.expiry.map_or(false, |e| Instant::now() >= e)
-// }
-
 pub type Fields = Arc<HashMap<String, String>>;
 
 pub type Entries = Arc<Mutex<VecDeque<Entry>>>;
@@ -59,12 +55,14 @@ pub struct Client {
 #[derive(Clone)]
 pub struct BlockedClient {
     pub client: Client,
-    pub from_right: bool,
-    pub blocked_by: Vec<String>
+    pub blocked_by: Vec<String>,
+    pub expired: bool,
+    pub from_right: Option<bool>, // BPOP
+    pub from_entry_id: Option<(u64, u64)>, // XREAD
+    pub count: Option<u64> // XREAD
 }
 
 #[derive(Clone)]
 pub struct Value {
-    pub val: ValueType,
-    pub expiry: Option<Instant>
+    pub val: ValueType
 }

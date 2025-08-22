@@ -32,28 +32,15 @@ fn resp_parse(to_parse: &[u8]) -> Vec<String> {
     parsed
 }
 
-fn str_to_i32<FOk: Fn(i32) -> i32>(to_parse: &String, ok_logic: FOk) -> Option<i32> {
-    match to_parse.parse::<i32>() {
-        Ok(val) => Some(ok_logic(val)),
-        Err(_) => None
-    }
-}
-
-fn str_to_f64<FOk: Fn(f64) -> f64>(to_parse: &String, ok_logic: FOk) -> Option<f64> {
-    match to_parse.parse::<f64>() {
-        Ok(val) => Some(ok_logic(val)),
-        Err(_) => None
-    }
-}
-
 fn set_pair(key: String, value: Value, client: &Client,
-                  mut guard: MutexGuard<'_, HashMap<String, Value>>) {
+            mut guard: MutexGuard<'_, HashMap<String, Value>>) {
     guard.insert(key, value);
     client.tx.send(b"+OK\r\n".to_vec()).unwrap();
 }
 
-async fn validate_added_entry_id(db: Database, stream_key: &String, entry_id: &String,
-                                 client: &Client) -> Option<EntryIdType> {
+async fn validate_added_entry_id(
+    db: Database, stream_key: &String, entry_id: &String, client: &Client
+) -> Option<EntryIdType> {
     if entry_id == "*" { // Full
         return Some(EntryIdType::Full(()));
     }
@@ -71,15 +58,21 @@ async fn validate_added_entry_id(db: Database, stream_key: &String, entry_id: &S
                     // Invalidate 0-0
                     if (ms_time, seq_num) == (0, 0) {
                         invalid_id(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
-                    } else if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+                    } else if let Some(last_entry) = get_last_entry(
+                        db.clone(), &stream_key
+                    ).await {
                         // Invalidate if not sequential to last entry
-                        if ms_time < last_entry.ms_time || (ms_time == last_entry.ms_time && seq_num <= last_entry.seq_num) {
+                        if ms_time < last_entry.ms_time
+                           || (ms_time == last_entry.ms_time
+                               && seq_num <= last_entry.seq_num) {
                             invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
                         } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
                     } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
                 }, (Ok(ms_time), _) if seq_num == "*" => { // Partial
                     // Invalidate if ms_time is not sequential to last entry
-                    if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
+                    if let Some(last_entry) = get_last_entry(
+                        db.clone(), &stream_key
+                    ).await {
                         if ms_time < last_entry.ms_time {
                             invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
                         } else { Some(EntryIdType::Partial(ms_time)) }
@@ -90,9 +83,10 @@ async fn validate_added_entry_id(db: Database, stream_key: &String, entry_id: &S
     }
 }
 
-async fn validate_ranged_entry_id(is_start: bool, entry_id: &String,
-                                  client: &Client) -> Option<EntryIdType> {
-    if (is_start && entry_id == "-") || (!is_start && entry_id == "+") { // Full
+async fn validate_read_entry_id<F: Fn(&String) -> bool>(
+    full_check: F, entry_id: &String, client: &Client
+) -> Option<EntryIdType> {
+    if full_check(entry_id) { // Full
         return Some(EntryIdType::Full(()));
     }
 
@@ -105,7 +99,8 @@ async fn validate_ranged_entry_id(is_start: bool, entry_id: &String,
     match entry_id.split_once('-') {
         Some((ms_time, seq_num)) => { // Explicit
             match (ms_time.parse::<u64>(), seq_num.parse::<u64>()) {
-                (Ok(ms_time), Ok(seq_num)) => Some(EntryIdType::Explicit((ms_time, seq_num))),
+                (Ok(ms_time), Ok(seq_num)) =>
+                    Some(EntryIdType::Explicit((ms_time, seq_num))),
                 _ => invalid_id()
             }
         }, None => { // Partial
@@ -141,11 +136,13 @@ async fn get_last_entry(db: Database, stream_key: &String) -> Option<Entry> {
     None
 }
 
-async fn get_last_seq_entry(db: Database, stream_key: &String, ms_time: u64) -> Option<Entry> {
+async fn get_last_seq_entry(db: Database, stream_key: &String,
+                            ms_time: u64) -> Option<Entry> {
     if let Some(value) = db.lock().await.get_mut(stream_key) {
         if let ValueType::Stream(stream) = &value.val {
-            // Iteration from the right assures max sequenced entry
-            if let Some(entry) = stream.entries.lock().await.iter().rfind(|e| e.ms_time == ms_time) {
+            // Iterate from the right to assure max sequence
+            if let Some(entry) = stream.entries.lock().await.iter()
+                                               .rfind(|e| e.ms_time == ms_time) {
                 return Some(entry.clone());
             }
         }
@@ -163,15 +160,16 @@ fn gen_ms() -> u64 {
 }
 
 async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
-    if let Some(last_entry) = get_last_entry(db.clone(), &stream_key).await {
-        // Same ms_time => Inc. seq_num
-        if ms_time == last_entry.ms_time { last_entry.seq_num + 1 }
-        // New ms_time (> last entry's as previously validated) => New sequence
-        else { 0 }
-    } else if ms_time > 0 { // Empty stream, non-zero ms_time => New sequence
-        0
-    } else { // Empty stream, ms_time = 0 => New sequence starting at 1
-        1
+    match get_last_entry(db.clone(), &stream_key).await {
+        Some(last_entry) => {
+            if ms_time == last_entry.ms_time { // Same ms_time
+                last_entry.seq_num + 1
+            } else { // Fresh ms_time (> last entry's as previously validated)
+                0
+            }
+        },
+        None if ms_time > 0 => 0,
+        None => 1 // ms_time = 0
     }
 }
 
@@ -190,29 +188,25 @@ async fn cmd_set(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     match parsed_cmd.len() {
         3 => { // SET [Key] [Value]
             let key = parsed_cmd[1].clone();
-            let value = Value {
-                val: ValueType::String(parsed_cmd[2].clone()),
-                expiry: None
-            };
+            let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
             set_pair(key, value, &client, guard);
-        }, 4 => { // SET [Key] [Value] [NX / XX / Wrong Syntax]
+        }, 4 => { // SET [Key] [Value] [NX / XX]
             let key = parsed_cmd[1].clone();
-            let value = Value {
-                val: ValueType::String(parsed_cmd[2].clone()),
-                expiry: None
-            };
+            let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
             // Set only if NX + key doesn't exist OR if XX + key exists
-            match (parsed_cmd[3].to_uppercase().as_str(), guard.contains_key(&key)) {
+            match (
+                parsed_cmd[3].to_uppercase().as_str(), guard.contains_key(&key)
+            ) {
                 ("NX", false) | ("XX", true) => set_pair(key, value, &client, guard),
                 ("NX", true) | ("XX", false) => client.tx.send(b"$-1\r\n".to_vec()).unwrap(),
                 _ => client.tx.send(b"-ERR syntax error\r\n".to_vec()).unwrap()
             }
-        }, 5 => { // SET [Key] [Value] [EX / PX / Wrong Syntax] [Stringified Number / Wrong Syntax]
+        }, 5 => { // SET [Key] [Value] [EX / PX] [Stringified Number]
             match parsed_cmd[3].to_uppercase().as_str() {
                 arg @ ("EX" | "PX") => {
                     // Extract expiry time (+ parse to milliseconds, check validity)
-                    let timeout = match str_to_i32(&parsed_cmd[4], |val| if arg == "EX" { val * 1000 } else { val }) {
-                        Some(v) if v > 0 => v,
+                    let timeout = match parsed_cmd[4].parse::<u64>() {
+                        Ok(t) if t > 0 => if arg == "EX" { t * 1000 } else { t },
                         _ => {
                             client.tx.send(b"-ERR invalid expire time in 'set' command\r\n".to_vec()).unwrap();
                             return;
@@ -220,10 +214,7 @@ async fn cmd_set(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
                     };
 
                     let key = parsed_cmd[1].clone();
-                    let value = Value {
-                        val: ValueType::String(parsed_cmd[2].clone()),
-                        expiry: Some(Instant::now() + Duration::from_millis(timeout as u64))
-                    };
+                    let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
 
                     // Insert + employ active expiration via Tokio-runtime
                     set_pair(key.clone(), value, &client, guard);
@@ -244,26 +235,18 @@ async fn cmd_get(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         return;
     }
 
-    let key = &parsed_cmd[1];
-
-    let guard = db.lock().await;
-    // Return (nil) if no such key is found
-    if !guard.contains_key(key) {
-        client.tx.send(b"$-1\r\n".to_vec()).unwrap();
-        return;
-    }
-
     // Extract + emit value
-    let value: Value = guard.get(key).unwrap().clone();
-    let val = match &value.val {
-        ValueType::String(val) => val,
-        _ => {
-            eprintln!("Extraction Error");
+    let val = match db.lock().await.get(&parsed_cmd[1]) {
+        Some(value) => match &value.val {
+            ValueType::String(val) => val.clone(),
+            _ => { panic!("Extraction Error"); }
+        }, None => {
+            client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
             return;
         }
     };
 
-    client.tx.send(format!("+{}\r\n", val).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("+{val}\r\n").as_bytes().to_vec()).unwrap();
 }
 
 async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
@@ -280,22 +263,34 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
     let val_list_len = val_list.len();
 
     {
-        let mut blocked_clients_guard = blocked_clients.lock().await;
         let mut to_unblock = Vec::new();
-        // Look for blocked clients waiting for push
+        let mut blocked_clients_guard = blocked_clients.lock().await;
+        // Look for blocked clients waiting for PUSH
         if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
             let pop_num = min(val_list.len(), blocked_list.len());
-            for _ in 0..pop_num {
-                let front_client = blocked_list.pop_front().unwrap();
-                // Extract value based on [R\L]PUSH and client's B[R\L]POP
-                let val = match (from_right, front_client.from_right) {
+            'outer: for _ in 0..pop_num {
+                // Pop from front a non-expired blocked client
+                let front_client = loop {
+                    match blocked_list.pop_front() {
+                        Some(bc) if !bc.expired => break bc,
+                        Some(_) => continue, // Expired
+                        None => break 'outer // Empty list
+                    }
+                };
+                // Pop value based on [R\L]PUSH and front client's B[R\L]POP
+                let front_client_from_right = match front_client.from_right {
+                    Some(f_r) => f_r,
+                    None => { break; } // Not blocked by BPOP operation
+                };
+                let val = match (from_right, front_client_from_right) {
                     (true, true) | (false, false) => val_list.pop_back().unwrap(),
                     (true, false) | (false, true) => val_list.pop_front().unwrap()
                 };
 
-                // Emit to front_client an array of key + popped value
-                front_client.client.tx.send(format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                                                    key.len(), key, val.len(), val).as_bytes().to_vec()).unwrap();
+                // Emit key + popped value
+                front_client.client.tx.send(format!("*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                                                    key.len(), val.len())
+                                            .as_bytes().to_vec()).unwrap();
                 
                 to_unblock.push(front_client);
             }
@@ -305,35 +300,21 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
         for blocked_client in to_unblock {
             for key in &blocked_client.blocked_by {
                 if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
-                    blocked_list.retain(|bc| bc.client.id != blocked_client.client.id);
+                    blocked_list.retain(
+                        |bc| bc.client.id != blocked_client.client.id
+                    );
                 }
             }
         }
     }
-
-    // Get updated number of values to push
-    let upd_val_list_len = val_list.len();
     
     let mut guard = db.lock().await;
-    // Create and insert string list if no such key is found
-    let stored_val_list_len = if !guard.contains_key(key) {
-        // Insert if there are still values to push
-        if upd_val_list_len > 0 {
-            let value = Value {
-                val: ValueType::StringList(val_list),
-                expiry: None
-            };
-            guard.insert(key.clone(), value);
-        }
-
-        val_list_len // Return OG length
-    } else {
-        let value = guard.get_mut(key).unwrap();
-        match &mut value.val {
-            // An existing string list is found
-            ValueType::StringList(stored_val_list) => {
-                // Insert if there are still values to push
-                if val_list_len > 0 {
+    // Create (if needed), insert, and calculate new list length
+    let stored_val_list_len = match guard.get_mut(key) {
+        Some(value) => match &mut value.val {
+            ValueType::StringList(stored_val_list) => { // An existing list is found
+                // Insert if there are values to push
+                if val_list.len() > 0 {
                     match from_right {
                         true => stored_val_list.extend(val_list),
                         false => while let Some(val) = val_list.pop_front() {
@@ -343,19 +324,27 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
                 }
 
                 stored_val_list.len()
-            }, // Value is of the wrong type
-            _ => {
+            }, _ => { // Value is of the wrong type
                 client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
                 return;
             }
+        }, None => {
+            // Create and insert list if there are values to push
+            if val_list.len() > 0 {
+                let value = Value { val: ValueType::StringList(val_list) };
+                guard.insert(key.clone(), value);
+            }
+
+            val_list_len // OG length
         }
     };
     
     // Emit the list's length
-    client.tx.send(format!(":{}\r\n", stored_val_list_len).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{stored_val_list_len}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>,
+                 client: &Client, db: Database) {
     let args_len = parsed_cmd.len();
     if args_len != 2 && args_len != 3 {
         let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
@@ -367,52 +356,50 @@ async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client, db
     // Get number of pops based on args length
     let pop_num = match args_len {
         2 => 1,
-        3 => match str_to_i32(&parsed_cmd[2], |val| val) {
-                Some(v) if v >= 0 => v, // 0 or positive number
-                _ => { // Negative number / not parseable
-                    client.tx.send(b"-ERR value is out of range, must be positive\r\n".to_vec()).unwrap();
-                    return;
-                }
-            },
-        _ => 0
+        3 => match parsed_cmd[2].parse::<u64>() {
+            Ok(v) => v,
+            _ => {
+                client.tx.send(b"-ERR value is out of range, must be positive\r\n".to_vec()).unwrap();
+                return;
+            }
+        }, _ => 0
     };
     
     let mut guard = db.lock().await;
-    // Return (nil) if no such key is found
-    if !guard.contains_key(key) {
-        client.tx.send(b"$-1\r\n".to_vec()).unwrap();
-        return;
-    }
-    
-    let value = guard.get_mut(key).unwrap();
-    match &mut value.val {
-        // An existing string list is found
-        ValueType::StringList(val_list) => {
-            // Clamp number of pops and set L/R functionality
-            let val_list_len = val_list.len();
-            let pop_num_usize: usize = min(pop_num as usize, val_list_len);
-            let mut pop = || if from_right { val_list.pop_back() } else { val_list.pop_front() };
+    match guard.get_mut(key) {
+        Some(value) => match &mut value.val {
+            ValueType::StringList(val_list) => { // An existing list is found
+                // Clamp number of pops and set L/R functionality
+                let val_list_len = val_list.len();
+                let pop_num_usize: usize = min(pop_num as usize, val_list_len);
+                let mut my_pop = || if from_right {
+                                        val_list.pop_back()
+                                    } else {
+                                        val_list.pop_front()
+                                    };
 
-            // Pop & build bulk string
-            let bulk_str = match pop_num_usize {
-                1 => match pop() {
-                        Some(v) => format!("+{}\r\n", v),
+                // Pop while building bulk string
+                let bulk_str = match pop_num_usize {
+                    1 => match my_pop() {
+                        Some(v) => format!("+{v}\r\n"),
                         None => return
-                    },
-                _ => format!("*{}\r\n{}", pop_num_usize,
-                        (0..pop_num_usize) // For [pop_num_usize] times
-                            .filter_map(|_| pop()) // Pop, filter & map popped values
-                            .map(|val| format!("${}\r\n{}\r\n", val.len(), val)) // Stringify each value
-                            .collect::<String>()) // Unify to one string
-            };
+                    }, _ => format!("*{pop_num_usize}\r\n{}",
+                                (0..pop_num_usize) // For [pop_num_usize] times
+                                    .filter_map(|_| my_pop()) // Pop -> filter -> map popped values
+                                    .map(|val| format!("${}\r\n{val}\r\n", val.len())) // Stringify
+                                    .collect::<String>()) // Unify to one string
+                };
 
-            client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
 
-            // Remove key if popped all values
-            if pop_num_usize == val_list_len { guard.remove(key); }
-        }, // Value is of the wrong type
-        _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
-    }
+                // Remove key if popped all values
+                if pop_num_usize == val_list_len {
+                    guard.remove(key);
+                }
+            }, // Value is of the wrong type
+            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+        }, None => client.tx.send(b"$-1\r\n".to_vec()).unwrap()
+    }    
 }
 
 async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
@@ -427,77 +414,79 @@ async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
     // Extract keys
     let keys: Vec<String> = parsed_cmd[1..args_len-1].to_vec();
 
-    // Try immediate pop
-    {
+    { // Try immediate pop
         let mut guard = db.lock().await;
         for key in &keys {
-            // Skip 
-            if !guard.contains_key(key) { continue; }
-
-            let value = guard.get_mut(key).unwrap();
-            let val: String = match &mut value.val {
-                // An existing string list is found
-                ValueType::StringList(val_list) =>
-                    match from_right {
+            let val = match guard.get_mut(key) {
+                Some(value) => match &mut value.val {
+                     // An existing list is found
+                    ValueType::StringList(val_list) => match from_right {
                         true => val_list.pop_back().unwrap(),
                         false => val_list.pop_front().unwrap()
-                    },
-                // Value is of the wrong type
-                _ => {
-                    client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
-                    return;
-                }
+                    }, _ => { // Value is of the wrong type
+                        client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                        return;
+                    }
+                }, None => { continue; } // Skip
             };
 
             // Emit key + popped value array
-            client.tx.send(format!("*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                                   key.len(), key, val.len(), val)
-                           .as_bytes().to_vec()).unwrap();
+            client.tx.send(format!("*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                                   key.len(), val.len()).as_bytes().to_vec()).unwrap();
             return;
         }
     }
 
-    // All keys are empty => add client to every blocked list
-    {
+    { // All keys are empty => Add client to every blocked list
         let mut blocked_clients_guard = blocked_clients.lock().await;
         for key in &keys {
             blocked_clients_guard
                 .entry(key.clone()) // Get entry of key if exists
-                .or_insert_with(VecDeque::new) // If not, create an empty list
-                .push_back(BlockedClient { // Push client to end of list
+                .or_insert_with(VecDeque::new) // Or create an empty list
+                .push_back(BlockedClient { // Push blocked client to end of list
                     client: client.clone(),
-                    from_right,
-                    blocked_by: keys.clone()
+                    blocked_by: keys.clone(),
+                    expired: false,
+                    from_right: Some(from_right),
+                    from_entry_id: None, // <- Nonfactor
+                    count: None // <- Nonfactor
                 });
         }
     }
 
-    // Extract timeout
-    let timeout = match str_to_f64(&parsed_cmd[args_len-1], |val| val) {
-        Some(v) if v >= 0.0 => v, // 0 or positive number
-        _ => { // Negative number / not parseable
+    // Extract non-negative timeout
+    let block = match parsed_cmd[args_len-1].parse::<f64>() {
+        Ok(v) if v >= 0.0 => v,
+        _ => {
             client.tx.send(b"-ERR timeout is negative\r\n".to_vec()).unwrap();
             return;
         }
     };
 
-    // Handle non-zero timeout via Tokio-runtime
-    if timeout > 0.0 {
+    // Handle non-zero block via Tokio-runtime
+    if block > 0.0 {
         let tokio_client = client.clone();
         let tokio_blocked_clients = blocked_clients.clone();
         let tokio_keys = keys.clone();
         tokio::spawn(async move {
-            sleep(Duration::from_secs_f64(timeout)).await;
+            sleep(Duration::from_secs_f64(block)).await;
 
             let mut blocked_clients_guard = tokio_blocked_clients.lock().await;
-            // Client is still blocked by some list (=> haven't popped yet)
-            if tokio_keys.iter().any(|key|
+            let mut still_blocked = false;
+            for key in &tokio_keys {
                 if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
-                    blocked_list.iter().any(|bc| bc.client.id == tokio_client.id)
-                } else { false }
-            ) {
-                // Emit (nil)
-                tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap();
+                    for blocked_client in blocked_list.iter_mut().filter(
+                        |bc| bc.client.id == tokio_client.id
+                    ) {
+                        // Client still blocked by some list (=> haven't popped yet)
+                        still_blocked = true;
+                        blocked_client.expired = true; // Update expiry
+                    }
+                }
+            }
+
+            if still_blocked {
+                tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
             }
         });
     }
@@ -511,58 +500,47 @@ async fn cmd_lrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
 
     // Extract key, start and stop args
     let key = &parsed_cmd[1];
-    let mut start = match str_to_i32(&parsed_cmd[2], |val| val) {
-        Some(v) => v,
-        None => {
+    let (mut start, mut stop) = match (
+        parsed_cmd[2].parse::<i32>(),
+        parsed_cmd[3].parse::<i32>()
+    ) {
+        (Ok(start), Ok(stop)) => (start, stop),
+        _ => {
             client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
             return;
         }
     };
-    let mut stop = match str_to_i32(&parsed_cmd[3], |val| val) {
-        Some(v) => v,
-        None => {
-            client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
-            return;
-        }
-    };
-    
-    let mut guard = db.lock().await;
-    // Emit an empty array if no such key is found
-    if !guard.contains_key(key) {
-        client.tx.send(b"*0\r\n".to_vec()).unwrap();
-        return;
-    }
 
-    let value = guard.get_mut(key).unwrap();
-    match &mut value.val {
-        // An existing string list is found
-        ValueType::StringList(val_list) => {
-            // Adjust and clamp start and stop
-            let val_list_len: i32 = val_list.len() as i32;
-            let adjust = |x: i32| if x < 0 { val_list_len + x } else { x };
-            start = adjust(start);
-            stop = adjust(stop);
-            if start < 0 { start = 0; }
-            if stop < 0 { stop = -1; }
-            // + Clamp stop to list range
-            stop = min(stop, val_list_len - 1);
+    match db.lock().await.get_mut(key) {
+        Some(value) => match &mut value.val {
+            ValueType::StringList(val_list) => { // An existing list is found
+                // Adjust + clamp start and stop
+                let val_list_len: i32 = val_list.len() as i32;
+                let adjust = |x: i32| if x < 0 { val_list_len + x } else { x };
+                start = adjust(start);
+                stop = adjust(stop);
+                if start < 0 { start = 0; }
+                if stop < 0 { stop = -1; }
+                // + Clamp stop to list range
+                stop = min(stop, val_list_len - 1);
 
-            // Emit an empty array if not valid post-adjustment
-            if start > stop {
-                client.tx.send(b"*0\r\n".to_vec()).unwrap();
-                return;
-            }
+                if start > stop { // Invalid post-adjustment
+                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
+                    return;
+                }
 
-            // Build bulk string
-            let range_size = stop - start + 1;
-            let mut bulk_str = format!("*{}\r\n", range_size);
-            for val in val_list.iter().skip(start as usize).take(range_size as usize) {
-                bulk_str.push_str(&format!("${}\r\n{}\r\n", val.len(), val));
-            }
+                // Build bulk string
+                let range_size = stop - start + 1;
+                let mut bulk_str = format!("*{range_size}\r\n");
+                for val in val_list.iter().skip(start as usize)
+                                   .take(range_size as usize) {
+                    bulk_str.push_str(&format!("${}\r\n{val}\r\n", val.len()));
+                }
 
-            client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
-        }, // Value is of the wrong type
-        _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+            }, // Value is of the wrong type
+            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+        }, None => client.tx.send(b"*0\r\n".to_vec()).unwrap() // Empty array
     }
 }
 
@@ -573,18 +551,18 @@ async fn cmd_llen(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     }
 
     let val_list_len = match db.lock().await.get_mut(&parsed_cmd[1]) {
-        None => 0, // No such key is found (=> no string list)
         Some(value) => match &mut value.val {
+            // An existing list is found
             ValueType::StringList(val_list) => val_list.len(),
             _ => { // Value is of the wrong type
                 client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
                 return;
             }
-        }
+        }, None => 0 // Key doesn't exist (and hence a list)
     };
 
     // Emit the list's length
-    client.tx.send(format!(":{}\r\n", val_list_len).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{val_list_len}\r\n").as_bytes().to_vec()).unwrap();
 }
 
 async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
@@ -597,16 +575,15 @@ async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         Some(value) => match &value.val {
             ValueType::String(_) => "string",
             ValueType::StringList(_) => "list",
-            ValueType::Stream(_) => "stream",
-            _ => "none"
-        },
-        None => "none"
+            ValueType::Stream(_) => "stream"
+        }, None => "none"
     };
 
-    client.tx.send(format!("+{}\r\n", val_type).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("+{val_type}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database,
+                  blocked_clients: BlockedClients) {
     let args_len = parsed_cmd.len();
     if args_len < 5 || args_len % 2 == 0 {
         client.tx.send(b"-ERR wrong number of arguments for 'xadd' command\r\n".to_vec()).unwrap();
@@ -615,9 +592,9 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
 
     // Extract stream key, entry ID (+ validate, automate), and fields
     let stream_key = &parsed_cmd[1];
-    let (ms_time, seq_num) = match validate_added_entry_id(db.clone(), &stream_key,
-                                                           &parsed_cmd[2], &client).await
-    {
+    let (ms_time, seq_num) = match validate_added_entry_id(
+        db.clone(), &stream_key, &parsed_cmd[2], &client
+    ).await {
         Some(EntryIdType::Full(_)) => {
             let ms = gen_ms();
             let seq = gen_seq(db.clone(), &stream_key, ms).await;
@@ -630,7 +607,7 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     };
     let mut map = HashMap::new();
     for i in (3..args_len).step_by(2) {
-        map.insert(parsed_cmd[i].clone(), parsed_cmd[i+1].clone());
+        map.insert(parsed_cmd[i].clone(), parsed_cmd[i + 1].clone());
     }
     let fields: Fields = Arc::new(map);
 
@@ -640,31 +617,97 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         seq_num: seq_num.clone(),
         fields
     };
-
-    let mut guard = db.lock().await;
-    // Insert entry to stream
-    if let Some(value) = guard.get_mut(stream_key) {
-        match &value.val {
-            // An existing stream is found
-            ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
-            // Value is of the wrong type
-            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+    
+    {
+        let mut guard = db.lock().await;
+        // Insert entry to stream
+        match guard.get_mut(stream_key) {
+            Some(value) => match &value.val {
+                // An existing stream is found
+                ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
+                // Value is of the wrong type
+                _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+            }, None => {
+                let entries = Entries::default();
+                // Insert entry + create stream
+                entries.lock().await.push_back(entry);
+                let stream = Value { val: ValueType::Stream(Stream { entries }) };
+                // Insert stream
+                guard.insert(stream_key.clone(), stream);
+            }
         }
-    } else {
-        let entries = Entries::default();
-        // Insert entry + create stream
-        entries.lock().await.push_back(entry);
-        let stream = Value {
-            val: ValueType::Stream(Stream { entries }),
-            expiry: None
-        };
-        // Insert stream
-        guard.insert(stream_key.clone(), stream);
+    }
+
+    {
+        let mut to_unblock = Vec::new();
+        let mut blocked_clients_guard = blocked_clients.lock().await;
+        // Look for blocked clients waiting for XADD
+        if let Some(blocked_list) = blocked_clients_guard.get_mut(stream_key) {
+            let guard = db.lock().await;
+            // Build + emit bulk string for each client
+            'outer: for blocked_client in blocked_list {
+                let mut bulk_str = String::new();
+                let mut with_following_entries = 0; // # of streams w/ following entries
+                // Iterate over streams
+                for key in &blocked_client.blocked_by {
+                    // Get the following entries of the client's specified entry
+                    let following_entries: Vec<Entry> = match guard.get(key) {
+                        Some(value) => match &value.val {
+                            ValueType::Stream(stream) => { // An existing stream is found
+                                let (ms_time_, seq_num_) = match blocked_client.from_entry_id {
+                                    Some((ms, seq)) => (ms, seq),
+                                    None => { break 'outer; } // Not blocked by XREAD operation
+                                };
+                                let f_e: Vec<Entry> = stream.entries.lock().await.iter().filter(
+                                    |e| ms_time_ < e.ms_time
+                                        || (ms_time_ == e.ms_time && seq_num_ < e.seq_num)
+                                ).take(
+                                    blocked_client.count.map(|c| c as usize).unwrap_or(usize::MAX)
+                                ).cloned().collect();
+
+                                if f_e.is_empty() { continue; } // No following entries
+                                with_following_entries += 1;
+
+                                f_e
+                            }, _ => continue // Value is of the wrong type
+                        }, None => { continue; } // Key doesn't exist
+                    };
+                    bulk_str.push_str(&format!("*2\r\n${}\r\n{key}\r\n*1\r\n", key.len()));
+                    // Iterate over entries
+                    for entry in following_entries {
+                        let entry_id = format!("{}-{}", entry.ms_time, entry.seq_num);
+                        bulk_str.push_str(&format!("*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
+                                                   entry_id.len(), entry.fields.len() * 2));
+                        // Iterate over entry's fields
+                        for (f_key, f_val) in entry.fields.iter() {
+                            bulk_str.push_str(&format!("${}\r\n{f_key}\r\n${}\r\n{f_val}\r\n",
+                                                       f_key.len(), f_val.len()));
+                        }
+                    }
+                }
+                bulk_str = format!("*{with_following_entries}\r\n{bulk_str}");
+                blocked_client.client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+
+                to_unblock.push(blocked_client.clone());
+            }
+        }
+
+        // Unblock clients from all keys attached to their XREAD command
+        for blocked_client in to_unblock {
+            for key in &blocked_client.blocked_by {
+                if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
+                    blocked_list.retain(
+                        |bc| bc.client.id != blocked_client.client.id
+                    );
+                }
+            }
+        }
     }
 
     // Emit the entry ID
     let entry_id = format!("{ms_time}-{seq_num}");
-    client.tx.send(format!("${}\r\n{}\r\n", entry_id.len(), entry_id).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("${}\r\n{entry_id}\r\n", entry_id.len())
+                   .as_bytes().to_vec()).unwrap();
 }
 
 async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
@@ -675,12 +718,14 @@ async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
 
     // Extract key + start, end entry IDs
     let stream_key = &parsed_cmd[1];
-    let (s_ms_time, s_seq_num) = match validate_ranged_entry_id(true, &parsed_cmd[2], &client).await {
+    let (s_ms_time, s_seq_num) = match validate_read_entry_id(
+        |e_id| e_id == "-", &parsed_cmd[2], &client
+    ).await {
         Some(EntryIdType::Full(_)) => { // Entry ID is '-'
             match get_first_entry(db.clone(), &stream_key).await {
                 Some(e) => (e.ms_time, e.seq_num),
                 None => { // No entries
-                    client.tx.send(b"*0\r\n".to_vec()).unwrap();
+                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
                     return;
                 }
             }
@@ -689,18 +734,20 @@ async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         Some(EntryIdType::Explicit((ms, seq))) => (ms, seq),
         None => return
     };
-    let (e_ms_time, e_seq_num) = match validate_ranged_entry_id(false, &parsed_cmd[3], &client).await {
+    let (e_ms_time, e_seq_num) = match validate_read_entry_id(
+        |e_id| e_id == "+", &parsed_cmd[3], &client
+    ).await {
         Some(EntryIdType::Full(_)) => { // Entry ID is '+'
             match get_last_entry(db.clone(), &stream_key).await {
                 Some(e) => (e.ms_time, e.seq_num),
                 None => { // No entries
-                    client.tx.send(b"*0\r\n".to_vec()).unwrap();
+                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
                     return;
                 }
             }
         },
         Some(EntryIdType::Partial(ms)) => {
-            // Set with the max seq_num of ms
+            // Set with the max seq_num of [ms]
             let seq = match get_last_seq_entry(db.clone(), &stream_key, ms).await {
                 Some(e) => e.seq_num,
                 None if ms > 0 => 0,
@@ -712,52 +759,256 @@ async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         None => return
     };
 
-    // Emit an empty array if range not sequential
+    // Range not sequential
     if s_ms_time > e_ms_time || (s_ms_time == e_ms_time && s_seq_num > e_seq_num) {
-        client.tx.send(b"*0\r\n".to_vec()).unwrap();
+        client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
         return;
     }
 
     if let Some(value) = db.lock().await.get_mut(stream_key) {
         match &value.val {
-            // An existing stream is found
-            ValueType::Stream(stream) => {
+            ValueType::Stream(stream) => { // An existing stream is found
                 // Filter entries based on range
                 let ranged: Vec<Entry> = stream.entries.lock().await.iter().filter(
-                    |e| s_ms_time <= e.ms_time && e_ms_time >= e.ms_time &&
-                        s_seq_num <= e.seq_num && e_seq_num >= e.seq_num
+                    |e| s_ms_time <= e.ms_time && e_ms_time >= e.ms_time
+                        && s_seq_num <= e.seq_num && e_seq_num >= e.seq_num
                 ).cloned().collect();
                 
                 // Build + emit bulk string
                 let mut bulk_str = String::new();
                 bulk_str.push_str(&format!("*{}\r\n", ranged.len()));
                 // Iterate over entries
-                for e in ranged {
-                    let e_id = format!("{}-{}", e.ms_time, e.seq_num);
-                    bulk_str.push_str(&format!("*2\r\n${}\r\n{e_id}\r\n*{}\r\n", e_id.len(), e.fields.len() * 2));
+                for entry in ranged {
+                    let e_id = format!("{}-{}", entry.ms_time, entry.seq_num);
+                    bulk_str.push_str(&format!("*2\r\n${}\r\n{e_id}\r\n*{}\r\n",
+                                               e_id.len(), entry.fields.len() * 2));
                     // Iterate over entry's fields
-                    for (key, val) in e.fields.iter() {
-                        bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()));
+                    for (key, val) in entry.fields.iter() {
+                        bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                                                   key.len(), val.len()));
                     }
                 }
 
                 client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
-            },
-            // Value is of the wrong type
+            }, // Value is of the wrong type
             _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
         }
     }
 }
 
+async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
+                   blocked_clients: BlockedClients) {
+    let args_len = parsed_cmd.len();
+    let wrong_args_len = || {
+        client.tx.send(b"-ERR wrong number of arguments for 'xread' command\r\n".to_vec()).unwrap();
+        return;
+    };
+    if args_len < 4 || args_len % 2 == 1 { wrong_args_len(); }
+
+    // Extract max count, block time, stream keys, and entry IDs
+    let arg_1 = parsed_cmd[1].to_uppercase();
+    let arg_3 = parsed_cmd[3].to_uppercase();
+    let arg_5 = parsed_cmd.get(5)
+                          .map(|s| s.to_uppercase())
+                          .unwrap_or_default(); // Safe indexing
+    let (count, block, mut stream_keys, mut entry_ids) = match (
+        arg_1.as_str(), arg_3.as_str(), arg_5.as_str()
+    ) {
+        ("COUNT", "BLOCK", "STREAMS") => {
+            if args_len < 8 { wrong_args_len(); }
+
+            let (c, b) = match (
+                parsed_cmd[2].parse::<u64>(),
+                parsed_cmd[4].parse::<u64>()
+            ) {
+                (Ok(c), Ok(b)) => (c, b),
+                _ => {
+                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                    return;
+                }
+            };
+            let key_num = (args_len - 6) / 2;
+            let s_k: Vec<String> = parsed_cmd[6..6+key_num].to_vec();
+            let e_i: Vec<String> = parsed_cmd[6+key_num..args_len].to_vec();
+
+            (Some(c), Some(b), s_k, e_i)
+        }, args @ (("COUNT", "STREAMS", _) | ("BLOCK", "STREAMS", _)) => {
+            if args_len < 6 { wrong_args_len(); }
+
+            let x = match parsed_cmd[2].parse::<u64>() { // Value of count / block
+                Ok(x) => x,
+                _ => {
+                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                    return;
+                }
+            };
+            let key_num = (args_len - 4) / 2;
+            let s_k: Vec<String> = parsed_cmd[4..4+key_num].to_vec();
+            let e_i: Vec<String> = parsed_cmd[4+key_num..args_len].to_vec();
+
+            match args.0 {
+                "COUNT" => (Some(x), None, s_k, e_i),
+                "BLOCK" => (None, Some(x), s_k, e_i),
+                _ => unreachable!() // By definition of args
+            }
+        }, ("STREAMS", _, _) => {
+            let key_num = (args_len - 2) / 2;
+            let s_k: Vec<String> = parsed_cmd[2..2+key_num].to_vec();
+            let e_i: Vec<String> = parsed_cmd[2+key_num..args_len].to_vec();
+
+            (None, None, s_k, e_i)
+        }, _ => {
+            client.tx.send(b"-ERR syntax error".to_vec()).unwrap();
+            return;
+        }
+    };
+
+    let to_block = block.is_some();
+    if !to_block {
+        // Clean up non-existing stream keys
+        let guard = db.lock().await;
+        let mut i = 0;
+        stream_keys.retain(|key| {
+            let exists = guard.get(key).is_some();
+            match exists {
+                true => i += 1, // Continue indexing
+                false => { entry_ids.remove(i); } // Remove respective entry ID
+            }
+
+            exists
+        });
+    }
+
+    // Parse entry IDs
+    let mut parsed_entry_ids = Vec::new();
+    for (i, entry_id) in entry_ids.iter().enumerate() {
+        let (ms_time, seq_num) = match validate_read_entry_id(
+            |e_id| to_block && e_id == "$", &entry_id, &client
+        ).await {
+            Some(EntryIdType::Full(_)) => { // Entry ID is '$'
+                if let Some(last_entry) = get_last_entry(
+                    db.clone(), &stream_keys[i]
+                ).await {
+                    (last_entry.ms_time, last_entry.seq_num)
+                } else { // No entries
+                    (0, 0)
+                }
+            },
+            Some(EntryIdType::Partial(ms)) => (ms, 0),
+            Some(EntryIdType::Explicit((ms, seq))) => (ms, seq),
+            None => return
+        };
+
+        parsed_entry_ids.push((ms_time, seq_num));
+    }
+    
+    let mut bulk_str = String::new();
+    let mut no_following_entries = 0; // # of streams w/o following entries
+    { // Try reading synchronously
+        let mut guard = db.lock().await;
+        // Iterate over streams
+        for (i, stream_key) in stream_keys.iter().enumerate() {
+            // Get the following entries of the specified entry
+            let following_entries: Vec<Entry> = match guard.get_mut(stream_key) {
+                Some(value) => match &value.val {
+                    ValueType::Stream(stream) => { // An existing stream is found
+                        let ms_time = parsed_entry_ids[i].0;
+                        let seq_num = parsed_entry_ids[i].1;
+                        let f_e: Vec<Entry> = stream.entries.lock().await.iter().filter(
+                            |e| ms_time < e.ms_time
+                                || (ms_time == e.ms_time && seq_num < e.seq_num)
+                        ).take(
+                            count.map(|c| c as usize).unwrap_or(usize::MAX)
+                        ).cloned().collect();
+
+                        if f_e.is_empty() {
+                            no_following_entries += 1;
+                            continue;
+                        }
+
+                        f_e
+                    }, _ => { // Value is of the wrong type
+                        client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                        return;
+                    }
+                }, None => { // Key doesn't exist
+                    no_following_entries += 1;
+                    continue;
+                }
+            };
+            bulk_str.push_str(&format!("*2\r\n${}\r\n{stream_key}\r\n*1\r\n",
+                                       stream_key.len()));
+            // Iterate over entries
+            for entry in following_entries {
+                let entry_id = format!("{}-{}", entry.ms_time, entry.seq_num);
+                bulk_str.push_str(&format!("*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
+                                           entry_id.len(), entry.fields.len() * 2));
+                // Iterate over entry's fields
+                for (key, val) in entry.fields.iter() {
+                    bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n",
+                                               key.len(), val.len()));
+                }
+            }
+        }
+    }
+    
+    if to_block && no_following_entries == stream_keys.len() { // Blocking
+        { // Add client to every blocked list
+            let mut blocked_clients_guard = blocked_clients.lock().await;
+            for (i, stream_key) in stream_keys.iter().enumerate() {
+                blocked_clients_guard
+                    .entry(stream_key.clone()) // Get entry of key if exists
+                    .or_insert_with(VecDeque::new) // Or create an empty list
+                    .push_back(BlockedClient { // Push blocked client to end of list
+                        client: client.clone(),
+                        blocked_by: stream_keys.clone(),
+                        expired: false,
+                        from_right: None, // <- Nonfactor
+                        from_entry_id: Some(parsed_entry_ids[i].clone()),
+                        count
+                    });
+            }
+        }
+        // Handle non-zero block via Tokio-runtime
+        if block.unwrap() > 0 {
+            let tokio_client = client.clone();
+            let tokio_blocked_clients = blocked_clients.clone();
+            let tokio_stream_keys = stream_keys.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(block.unwrap())).await;
+
+                let mut still_blocked = false;
+                let mut blocked_clients_guard = tokio_blocked_clients.lock().await;
+                for stream_key in &tokio_stream_keys {
+                    if let Some(blocked_list) = blocked_clients_guard.get_mut(stream_key) {
+                        for blocked_client in blocked_list.iter_mut().filter(
+                            |bc| bc.client.id == tokio_client.id
+                        ) {
+                            still_blocked = true;
+                            blocked_client.expired = true; // Update expiry
+                        }
+                    }
+                }
+
+                if still_blocked {
+                    tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
+                }
+            });
+        }
+    } else { // Synchronous
+        bulk_str = format!("*{}\r\n{bulk_str}", stream_keys.len() - no_following_entries);
+        client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+    }
+}
+
 fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
-    // Build error string
-    let mut err_str = format!("-ERR unknown command `{}`, with args beginning with: ", parsed_cmd[0]);
+    // Build + emit error string
+    let mut err_str = format!("-ERR unknown command '{}', with args beginning with: ", parsed_cmd[0]);
     for arg in &parsed_cmd[1..] {
-        err_str.push_str(&format!("`{}`, ", arg));
+        err_str.push_str(&format!("'{arg}', "));
     }
     err_str.push_str("\r\n");
 
-    // Emit the string
     client.tx.send(err_str.as_bytes().to_vec()).unwrap();
 }
 
@@ -780,8 +1031,9 @@ async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
         "LRANGE" => cmd_lrange(&parsed_cmd, &client, db).await,
         "LLEN"   => cmd_llen(&parsed_cmd, &client, db).await,
         "TYPE"   => cmd_type(&parsed_cmd, &client, db).await,
-        "XADD"   => cmd_xadd(&parsed_cmd, &client, db).await,
+        "XADD"   => cmd_xadd(&parsed_cmd, &client, db, blocked_clients).await,
         "XRANGE" => cmd_xrange(&parsed_cmd, &client, db).await,
+        "XREAD"  => cmd_xread(&parsed_cmd, &client, db, blocked_clients).await,
         _        => cmd_other(&parsed_cmd, &client)
     }
 }
