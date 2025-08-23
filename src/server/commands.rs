@@ -1041,6 +1041,22 @@ async fn cmd_exec(client: &Client, db: Database, blocked_clients: BlockedClients
     }
 }
 
+async fn cmd_discard(client: &Client) {
+    {
+        let mut in_transaction = client.in_transaction.lock().await;
+        if !*in_transaction {
+            client.tx.send(b"-ERR DISCARD without MULTI\r\n".to_vec()).unwrap();
+            return;
+        }
+        *in_transaction = false; // End transaction
+    }
+
+    // Empty command queue
+    client.queued_commands.lock().await.clear();
+
+    client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+}
+
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
     // Build + emit error string
     let mut err_str = format!("-ERR unknown command '{cmd_name}', with args beginning with: ");
@@ -1059,44 +1075,43 @@ pub struct Command {
 }
 
 impl Command {
-    fn get_args(&mut self) -> Vec<String> {
-        self.args.take().unwrap_or_else(Vec::new)
-    }
-
     pub async fn execute(&mut self, client: &Client, db: Database,
                          blocked_clients: BlockedClients) {
-        let uc_name = self.name.to_uppercase(); // Extract uppercased name
-
-        // Queue a non-EXEC command if in transaction mode
-        if *client.in_transaction.lock().await&& uc_name.as_str() != "EXEC" {
+        let uc_name = self.name.to_uppercase();
+        let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
+        // Queue a non-EXEC/DISCARD command if in transaction mode
+        if *client.in_transaction.lock().await
+           && !transactional_cmds.contains(&uc_name.as_str()) {
             client.queued_commands.lock().await.push(self.clone());
             client.tx.send(b"+QUEUED\r\n".to_vec()).unwrap();
             return;
         }
-        
-        let args = self.get_args(); // Extract arguments
+
+        // Extract arguments
+        let args = self.args.take().unwrap_or_else(Vec::new);
 
         match uc_name.as_str() {
-            "PING"   => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
-            "ECHO"   => cmd_echo(args, &client),
-            "SET"    => cmd_set(args, &client, db).await,
-            "GET"    => cmd_get(args, &client, db).await,
-            "RPUSH"  => cmd_push(true, args, &client, db, blocked_clients).await,
-            "LPUSH"  => cmd_push(false, args, &client, db, blocked_clients).await,
-            "RPOP"   => cmd_pop(true, args, &client, db).await,
-            "LPOP"   => cmd_pop(false, args, &client, db).await,
-            "BRPOP"  => cmd_bpop(true, args, &client, db, blocked_clients).await,
-            "BLPOP"  => cmd_bpop(false, args, &client, db, blocked_clients).await,
-            "LRANGE" => cmd_lrange(args, &client, db).await,
-            "LLEN"   => cmd_llen(args, &client, db).await,
-            "TYPE"   => cmd_type(args, &client, db).await,
-            "XADD"   => cmd_xadd(args, &client, db, blocked_clients).await,
-            "XRANGE" => cmd_xrange(args, &client, db).await,
-            "XREAD"  => cmd_xread(args, &client, db, blocked_clients).await,
-            "INCR"   => cmd_incr(args, &client, db).await,
-            "MULTI"  => cmd_multi(&client).await,
-            "EXEC"   => cmd_exec(&client, db, blocked_clients).await,
-            _        => cmd_other(&self.name, args, &client)
+            "PING"    => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
+            "ECHO"    => cmd_echo(args, &client),
+            "SET"     => cmd_set(args, &client, db).await,
+            "GET"     => cmd_get(args, &client, db).await,
+            "RPUSH"   => cmd_push(true, args, &client, db, blocked_clients).await,
+            "LPUSH"   => cmd_push(false, args, &client, db, blocked_clients).await,
+            "RPOP"    => cmd_pop(true, args, &client, db).await,
+            "LPOP"    => cmd_pop(false, args, &client, db).await,
+            "BRPOP"   => cmd_bpop(true, args, &client, db, blocked_clients).await,
+            "BLPOP"   => cmd_bpop(false, args, &client, db, blocked_clients).await,
+            "LRANGE"  => cmd_lrange(args, &client, db).await,
+            "LLEN"    => cmd_llen(args, &client, db).await,
+            "TYPE"    => cmd_type(args, &client, db).await,
+            "XADD"    => cmd_xadd(args, &client, db, blocked_clients).await,
+            "XRANGE"  => cmd_xrange(args, &client, db).await,
+            "XREAD"   => cmd_xread(args, &client, db, blocked_clients).await,
+            "INCR"    => cmd_incr(args, &client, db).await,
+            "MULTI"   => cmd_multi(&client).await,
+            "EXEC"    => cmd_exec(&client, db, blocked_clients).await,
+            "DISCARD" => cmd_discard(&client).await,
+            _         => cmd_other(&self.name, args, &client)
         }
     }
 }
