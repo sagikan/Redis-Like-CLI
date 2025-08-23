@@ -1,10 +1,9 @@
-#![allow(unused_imports)]
 use std::collections::{VecDeque, HashMap};
-use std::time::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
+use crate::commands::Command;
 
 static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -20,8 +19,6 @@ pub type Database = Arc<Mutex<HashMap<String, Value>>>;
 
 pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
 
-pub type QueuedCommands = Arc<Mutex<HashMap<Client, Vec<Command>>>>;
-
 #[derive(Clone)]
 pub enum ValueType {
     String(String),
@@ -34,12 +31,6 @@ pub enum EntryIdType {
     Full(()),
     Partial(u64),
     Explicit((u64, u64))
-}
-
-#[derive(Clone)]
-pub struct Command {
-    pub name: String,
-    pub args: Option<Vec<String>>
 }
 
 #[derive(Clone)]
@@ -58,7 +49,8 @@ pub struct Stream {
 pub struct Client {
     pub id: u64,
     pub tx: UnboundedSender<Vec<u8>>,
-    pub in_transaction: Arc<Mutex<bool>>
+    pub in_transaction: Arc<Mutex<bool>>,
+    pub queued_commands: Arc<Mutex<Vec<Command>>>
 }
 
 #[derive(Clone)]
