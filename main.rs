@@ -5,18 +5,17 @@ use std::cmp::min;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::MutexGuard;
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
 
-fn resp_parse(to_parse: &[u8]) -> Vec<String> {
+fn resp_parse(to_parse: &[u8]) -> Option<Command> {
     let unparsed_str = std::str::from_utf8(to_parse).unwrap();
     let mut lines = unparsed_str.split("\r\n");
 
-    // Skip array header
-    lines.next();
+    lines.next(); // Skip array header
 
     let mut parsed = Vec::new();
     while let Some(curr_line) = lines.next() {
@@ -29,7 +28,16 @@ fn resp_parse(to_parse: &[u8]) -> Vec<String> {
         }
     }
 
-    parsed
+    let args = match parsed.len() {
+        0 => { return None; } // Empty command
+        1 => None,
+        _ => Some(Vec::from(parsed[1..].to_vec()))
+    };
+
+    Some(Command {
+        name: parsed[0].clone(),
+        args
+    })
 }
 
 fn set_pair(key: String, value: Value, client: &Client,
@@ -173,39 +181,39 @@ async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
     }
 }
 
-fn cmd_echo(parsed_cmd: &Vec<String>, client: &Client) {
-    if let Some(_val) = parsed_cmd.get(1) {
-        let to_write = format!("+{}\r\n", parsed_cmd[1..].join(" "));
+fn cmd_echo(args: Vec<String>, client: &Client) {
+    if let Some(_val) = args.get(0) {
+        let to_write = format!("+{}\r\n", args[0..].join(" "));
         client.tx.send(to_write.as_bytes().to_vec()).unwrap();
     } else {
         client.tx.send(b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()).unwrap();
     }
 }
 
-async fn cmd_set(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
     let guard = db.lock().await;
 
-    match parsed_cmd.len() {
-        3 => { // SET [Key] [Value]
-            let key = parsed_cmd[1].clone();
-            let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
+    match args.len() {
+        2 => { // [Key] [Value]
+            let key = args[0].clone();
+            let value = Value { val: ValueType::String(args[1].clone()) };
             set_pair(key, value, &client, guard);
-        }, 4 => { // SET [Key] [Value] [NX / XX]
-            let key = parsed_cmd[1].clone();
-            let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
+        }, 3 => { // [Key] [Value] [NX / XX]
+            let key = args[0].clone();
+            let value = Value { val: ValueType::String(args[1].clone()) };
             // Set only if NX + key doesn't exist OR if XX + key exists
             match (
-                parsed_cmd[3].to_uppercase().as_str(), guard.contains_key(&key)
+                args[2].to_uppercase().as_str(), guard.contains_key(&key)
             ) {
                 ("NX", false) | ("XX", true) => set_pair(key, value, &client, guard),
                 ("NX", true) | ("XX", false) => client.tx.send(b"$-1\r\n".to_vec()).unwrap(),
                 _ => client.tx.send(b"-ERR syntax error\r\n".to_vec()).unwrap()
             }
-        }, 5 => { // SET [Key] [Value] [EX / PX] [Stringified Number]
-            match parsed_cmd[3].to_uppercase().as_str() {
+        }, 4 => { // [Key] [Value] [EX / PX] [Stringified Number]
+            match args[2].to_uppercase().as_str() {
                 arg @ ("EX" | "PX") => {
                     // Extract expiry time (+ parse to milliseconds, check validity)
-                    let timeout = match parsed_cmd[4].parse::<u64>() {
+                    let timeout = match args[3].parse::<u64>() {
                         Ok(t) if t > 0 => if arg == "EX" { t * 1000 } else { t },
                         _ => {
                             client.tx.send(b"-ERR invalid expire time in 'set' command\r\n".to_vec()).unwrap();
@@ -213,8 +221,8 @@ async fn cmd_set(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
                         }
                     };
 
-                    let key = parsed_cmd[1].clone();
-                    let value = Value { val: ValueType::String(parsed_cmd[2].clone()) };
+                    let key = args[0].clone();
+                    let value = Value { val: ValueType::String(args[1].clone()) };
 
                     // Insert + employ active expiration via Tokio-runtime
                     set_pair(key.clone(), value, &client, guard);
@@ -229,14 +237,14 @@ async fn cmd_set(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     }
 }
 
-async fn cmd_get(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 2 {
+async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 1 {
         client.tx.send(b"-ERR wrong number of arguments for 'get' command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract + emit value
-    let val = match db.lock().await.get(&parsed_cmd[1]) {
+    let val = match db.lock().await.get(&args[0]) {
         Some(value) => match &value.val {
             ValueType::String(val) => val.clone(),
             _ => { panic!("Extraction Error"); }
@@ -249,17 +257,16 @@ async fn cmd_get(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
+async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
                   db: Database, blocked_clients: BlockedClients) {
-    if parsed_cmd.len() < 3 {
-        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
-        client.tx.send(err_str.as_bytes().to_vec()).unwrap();
+    if args.len() < 2 {
+        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract key and values
-    let key = &parsed_cmd[1];
-    let mut val_list: VecDeque<String> = parsed_cmd[2..].iter().cloned().collect();
+    let key = &args[0];
+    let mut val_list: VecDeque<String> = args[1..].iter().cloned().collect();
     let val_list_len = val_list.len();
 
     {
@@ -343,20 +350,19 @@ async fn cmd_push(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
     client.tx.send(format!(":{stored_val_list_len}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>,
-                 client: &Client, db: Database) {
-    let args_len = parsed_cmd.len();
-    if args_len != 2 && args_len != 3 {
-        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
-        client.tx.send(err_str.as_bytes().to_vec()).unwrap();
+async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
+                 db: Database) {
+    let args_len = args.len();
+    if args_len != 1 && args_len != 2 {
+        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
         return;
     }
 
-    let key = &parsed_cmd[1];
+    let key = &args[0];
     // Get number of pops based on args length
     let pop_num = match args_len {
-        2 => 1,
-        3 => match parsed_cmd[2].parse::<u64>() {
+        1 => 1,
+        2 => match args[1].parse::<u64>() {
             Ok(v) => v,
             _ => {
                 client.tx.send(b"-ERR value is out of range, must be positive\r\n".to_vec()).unwrap();
@@ -372,11 +378,8 @@ async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>,
                 // Clamp number of pops and set L/R functionality
                 let val_list_len = val_list.len();
                 let pop_num_usize: usize = min(pop_num as usize, val_list_len);
-                let mut my_pop = || if from_right {
-                                        val_list.pop_back()
-                                    } else {
-                                        val_list.pop_front()
-                                    };
+                let mut my_pop = || if from_right { val_list.pop_back() }
+                                    else { val_list.pop_front() };
 
                 // Pop while building bulk string
                 let bulk_str = match pop_num_usize {
@@ -402,17 +405,16 @@ async fn cmd_pop(from_right: bool, parsed_cmd: &Vec<String>,
     }    
 }
 
-async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
+async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
                   db: Database, blocked_clients: BlockedClients) {
-    let args_len = parsed_cmd.len();
-    if args_len < 3 {
-        let err_str = format!("-ERR wrong number of arguments for '{}' command\r\n", parsed_cmd[0].to_lowercase());
-        client.tx.send(err_str.as_bytes().to_vec()).unwrap();
+    let args_len = args.len();
+    if args_len < 2 {
+        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract keys
-    let keys: Vec<String> = parsed_cmd[1..args_len-1].to_vec();
+    let keys: Vec<String> = args[0..args_len-1].to_vec();
 
     { // Try immediate pop
         let mut guard = db.lock().await;
@@ -455,7 +457,7 @@ async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
     }
 
     // Extract non-negative timeout
-    let block = match parsed_cmd[args_len-1].parse::<f64>() {
+    let block = match args[args_len-1].parse::<f64>() {
         Ok(v) if v >= 0.0 => v,
         _ => {
             client.tx.send(b"-ERR timeout is negative\r\n".to_vec()).unwrap();
@@ -477,8 +479,7 @@ async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
                 if let Some(blocked_list) = blocked_clients_guard.get_mut(key) {
                     for blocked_client in blocked_list.iter_mut().filter(
                         |bc| bc.client.id == tokio_client.id
-                    ) {
-                        // Client still blocked by some list (=> haven't popped yet)
+                    ) { // Client still blocked by some list (=> haven't popped yet)
                         still_blocked = true;
                         blocked_client.expired = true; // Update expiry
                     }
@@ -492,17 +493,17 @@ async fn cmd_bpop(from_right: bool, parsed_cmd: &Vec<String>, client: &Client,
     }
 }
 
-async fn cmd_lrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 4 {
+async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 3 {
         client.tx.send(b"-ERR wrong number of arguments for 'lrange' command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract key, start and stop args
-    let key = &parsed_cmd[1];
+    let key = &args[0];
     let (mut start, mut stop) = match (
-        parsed_cmd[2].parse::<i32>(),
-        parsed_cmd[3].parse::<i32>()
+        args[1].parse::<i32>(),
+        args[2].parse::<i32>()
     ) {
         (Ok(start), Ok(stop)) => (start, stop),
         _ => {
@@ -544,13 +545,13 @@ async fn cmd_lrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     }
 }
 
-async fn cmd_llen(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 2 {
+async fn cmd_llen(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 1 {
         client.tx.send(b"-ERR wrong number of arguments for 'llen' command".to_vec()).unwrap();
         return;
     }
 
-    let val_list_len = match db.lock().await.get_mut(&parsed_cmd[1]) {
+    let val_list_len = match db.lock().await.get_mut(&args[0]) {
         Some(value) => match &mut value.val {
             // An existing list is found
             ValueType::StringList(val_list) => val_list.len(),
@@ -565,13 +566,13 @@ async fn cmd_llen(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!(":{val_list_len}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 2 {
+async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 1 {
         client.tx.send(b"-ERR wrong number of arguments for 'type' command\r\n".to_vec()).unwrap();
         return;
     }
     
-    let val_type = match db.lock().await.get(&parsed_cmd[1]) {
+    let val_type = match db.lock().await.get(&args[0]) {
         Some(value) => match &value.val {
             ValueType::String(_) => "string",
             ValueType::StringList(_) => "list",
@@ -582,18 +583,18 @@ async fn cmd_type(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val_type}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database,
+async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                   blocked_clients: BlockedClients) {
-    let args_len = parsed_cmd.len();
-    if args_len < 5 || args_len % 2 == 0 {
+    let args_len = args.len();
+    if args_len < 4 || args_len % 2 == 1 {
         client.tx.send(b"-ERR wrong number of arguments for 'xadd' command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract stream key, entry ID (+ validate, automate), and fields
-    let stream_key = &parsed_cmd[1];
+    let stream_key = &args[0];
     let (ms_time, seq_num) = match validate_added_entry_id(
-        db.clone(), &stream_key, &parsed_cmd[2], &client
+        db.clone(), &stream_key, &args[1], &client
     ).await {
         Some(EntryIdType::Full(_)) => {
             let ms = gen_ms();
@@ -606,8 +607,8 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database,
         None => return
     };
     let mut map = HashMap::new();
-    for i in (3..args_len).step_by(2) {
-        map.insert(parsed_cmd[i].clone(), parsed_cmd[i + 1].clone());
+    for i in (2..args_len).step_by(2) {
+        map.insert(args[i].clone(), args[i + 1].clone());
     }
     let fields: Fields = Arc::new(map);
 
@@ -710,16 +711,16 @@ async fn cmd_xadd(parsed_cmd: &Vec<String>, client: &Client, db: Database,
                    .as_bytes().to_vec()).unwrap();
 }
 
-async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 4 {
+async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 3 {
         client.tx.send(b"-ERR wrong number of arguments for 'xrange' command\r\n".to_vec()).unwrap();
         return;
     }
 
     // Extract key + start, end entry IDs
-    let stream_key = &parsed_cmd[1];
+    let stream_key = &args[0];
     let (s_ms_time, s_seq_num) = match validate_read_entry_id(
-        |e_id| e_id == "-", &parsed_cmd[2], &client
+        |e_id| e_id == "-", &args[1], &client
     ).await {
         Some(EntryIdType::Full(_)) => { // Entry ID is '-'
             match get_first_entry(db.clone(), &stream_key).await {
@@ -735,7 +736,7 @@ async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
         None => return
     };
     let (e_ms_time, e_seq_num) = match validate_read_entry_id(
-        |e_id| e_id == "+", &parsed_cmd[3], &client
+        |e_id| e_id == "+", &args[2], &client
     ).await {
         Some(EntryIdType::Full(_)) => { // Entry ID is '+'
             match get_last_entry(db.clone(), &stream_key).await {
@@ -796,30 +797,30 @@ async fn cmd_xrange(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     }
 }
 
-async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
+async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
                    blocked_clients: BlockedClients) {
-    let args_len = parsed_cmd.len();
+    let args_len = args.len();
     let wrong_args_len = || {
         client.tx.send(b"-ERR wrong number of arguments for 'xread' command\r\n".to_vec()).unwrap();
         return;
     };
-    if args_len < 4 || args_len % 2 == 1 { wrong_args_len(); }
+    if args_len < 3 || args_len % 2 == 0 { wrong_args_len(); }
 
     // Extract max count, block time, stream keys, and entry IDs
-    let arg_1 = parsed_cmd[1].to_uppercase();
-    let arg_3 = parsed_cmd[3].to_uppercase();
-    let arg_5 = parsed_cmd.get(5)
-                          .map(|s| s.to_uppercase())
-                          .unwrap_or_default(); // Safe indexing
+    let arg_1 = args[0].to_uppercase();
+    let arg_3 = args[2].to_uppercase();
+    let arg_5 = args.get(4)
+                    .map(|s| s.to_uppercase())
+                    .unwrap_or_default(); // Safe indexing
     let (count, block, mut stream_keys, mut entry_ids) = match (
         arg_1.as_str(), arg_3.as_str(), arg_5.as_str()
     ) {
         ("COUNT", "BLOCK", "STREAMS") => {
-            if args_len < 8 { wrong_args_len(); }
+            if args_len < 7 { wrong_args_len(); }
 
             let (c, b) = match (
-                parsed_cmd[2].parse::<u64>(),
-                parsed_cmd[4].parse::<u64>()
+                args[1].parse::<u64>(),
+                args[3].parse::<u64>()
             ) {
                 (Ok(c), Ok(b)) => (c, b),
                 _ => {
@@ -827,34 +828,34 @@ async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
                     return;
                 }
             };
-            let key_num = (args_len - 6) / 2;
-            let s_k: Vec<String> = parsed_cmd[6..6+key_num].to_vec();
-            let e_i: Vec<String> = parsed_cmd[6+key_num..args_len].to_vec();
+            let key_num = (args_len - 5) / 2;
+            let s_k: Vec<String> = args[5..5+key_num].to_vec();
+            let e_i: Vec<String> = args[5+key_num..args_len].to_vec();
 
             (Some(c), Some(b), s_k, e_i)
-        }, args @ (("COUNT", "STREAMS", _) | ("BLOCK", "STREAMS", _)) => {
-            if args_len < 6 { wrong_args_len(); }
+        }, arg_names @ (("COUNT", "STREAMS", _) | ("BLOCK", "STREAMS", _)) => {
+            if args_len < 5 { wrong_args_len(); }
 
-            let x = match parsed_cmd[2].parse::<u64>() { // Value of count / block
+            let x = match args[1].parse::<u64>() { // Value of count / block
                 Ok(x) => x,
                 _ => {
                     client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
                     return;
                 }
             };
-            let key_num = (args_len - 4) / 2;
-            let s_k: Vec<String> = parsed_cmd[4..4+key_num].to_vec();
-            let e_i: Vec<String> = parsed_cmd[4+key_num..args_len].to_vec();
+            let key_num = (args_len - 3) / 2;
+            let s_k: Vec<String> = args[3..3+key_num].to_vec();
+            let e_i: Vec<String> = args[3+key_num..args_len].to_vec();
 
-            match args.0 {
+            match arg_names.0 {
                 "COUNT" => (Some(x), None, s_k, e_i),
                 "BLOCK" => (None, Some(x), s_k, e_i),
                 _ => unreachable!() // By definition of args
             }
         }, ("STREAMS", _, _) => {
-            let key_num = (args_len - 2) / 2;
-            let s_k: Vec<String> = parsed_cmd[2..2+key_num].to_vec();
-            let e_i: Vec<String> = parsed_cmd[2+key_num..args_len].to_vec();
+            let key_num = (args_len - 1) / 2;
+            let s_k: Vec<String> = args[1..1+key_num].to_vec();
+            let e_i: Vec<String> = args[1+key_num..args_len].to_vec();
 
             (None, None, s_k, e_i)
         }, _ => {
@@ -969,6 +970,7 @@ async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
                     });
             }
         }
+
         // Handle non-zero block via Tokio-runtime
         if block.unwrap() > 0 {
             let tokio_client = client.clone();
@@ -1001,13 +1003,13 @@ async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
     }
 }
 
-async fn cmd_incr(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
-    if parsed_cmd.len() != 2 {
+async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
+    if args.len() != 1 {
         client.tx.send(b"-ERR wrong number of arguments for 'incr' command\r\n".to_vec()).unwrap();
         return;
     }
 
-    let key = &parsed_cmd[1];
+    let key = &args[0];
 
     let mut guard = db.lock().await;
     let incr_val: String = match guard.get_mut(key) {
@@ -1041,10 +1043,22 @@ async fn cmd_incr(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!(":{incr_val}\r\n").as_bytes().to_vec()).unwrap();
 }
 
-fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
+async fn cmd_multi(client: &Client) {
+    let mut in_transaction = client.in_transaction.lock().await;
+    if *in_transaction {
+        client.tx.send(b"-ERR MULTI calls can not be nested".to_vec()).unwrap();
+        return;
+    }
+
+    *in_transaction = true; // Start transation
+
+    client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+}
+
+fn cmd_other(cmd_name: String, args: Vec<String>, client: &Client) {
     // Build + emit error string
-    let mut err_str = format!("-ERR unknown command '{}', with args beginning with: ", parsed_cmd[0]);
-    for arg in &parsed_cmd[1..] {
+    let mut err_str = format!("-ERR unknown command '{cmd_name}', with args beginning with: ");
+    for arg in &args[0..] {
         err_str.push_str(&format!("'{arg}', "));
     }
     err_str.push_str("\r\n");
@@ -1053,29 +1067,38 @@ fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
 }
 
 async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
-                     blocked_clients: BlockedClients) {
-    let parsed_cmd: Vec<String> = resp_parse(cmd);
+                     blocked_clients: BlockedClients,
+                     _queued_commands: QueuedCommands) {
+    let (cmd_name, args) = match resp_parse(cmd) {
+        Some(cmd) => (cmd.name, cmd.args.unwrap_or(Vec::new())),
+        None => { // Empty command
+            client.tx.send(b"-ERR unknown command ''".to_vec()).unwrap();
+            return;
+        }
+    };
 
     // Handle by command
-    match parsed_cmd[0].to_uppercase().as_str() {
+    match cmd_name.to_uppercase().as_str() {
         "PING"   => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
-        "ECHO"   => cmd_echo(&parsed_cmd, &client),
-        "SET"    => cmd_set(&parsed_cmd, &client, db).await,
-        "GET"    => cmd_get(&parsed_cmd, &client, db).await,
-        "RPUSH"  => cmd_push(true, &parsed_cmd, &client, db, blocked_clients).await,
-        "LPUSH"  => cmd_push(false, &parsed_cmd, &client, db, blocked_clients).await,
-        "RPOP"   => cmd_pop(true, &parsed_cmd, &client, db).await,
-        "LPOP"   => cmd_pop(false, &parsed_cmd, &client, db).await,
-        "BRPOP"  => cmd_bpop(true, &parsed_cmd, &client, db, blocked_clients).await,
-        "BLPOP"  => cmd_bpop(false, &parsed_cmd, &client, db, blocked_clients).await,
-        "LRANGE" => cmd_lrange(&parsed_cmd, &client, db).await,
-        "LLEN"   => cmd_llen(&parsed_cmd, &client, db).await,
-        "TYPE"   => cmd_type(&parsed_cmd, &client, db).await,
-        "XADD"   => cmd_xadd(&parsed_cmd, &client, db, blocked_clients).await,
-        "XRANGE" => cmd_xrange(&parsed_cmd, &client, db).await,
-        "XREAD"  => cmd_xread(&parsed_cmd, &client, db, blocked_clients).await,
-        "INCR"   => cmd_incr(&parsed_cmd, &client, db).await,
-        _        => cmd_other(&parsed_cmd, &client)
+        "ECHO"   => cmd_echo(args, &client),
+        "SET"    => cmd_set(args, &client, db).await,
+        "GET"    => cmd_get(args, &client, db).await,
+        "RPUSH"  => cmd_push(true, args, &client, db, blocked_clients).await,
+        "LPUSH"  => cmd_push(false, args, &client, db, blocked_clients).await,
+        "RPOP"   => cmd_pop(true, args, &client, db).await,
+        "LPOP"   => cmd_pop(false, args, &client, db).await,
+        "BRPOP"  => cmd_bpop(true, args, &client, db, blocked_clients).await,
+        "BLPOP"  => cmd_bpop(false, args, &client, db, blocked_clients).await,
+        "LRANGE" => cmd_lrange(args, &client, db).await,
+        "LLEN"   => cmd_llen(args, &client, db).await,
+        "TYPE"   => cmd_type(args, &client, db).await,
+        "XADD"   => cmd_xadd(args, &client, db, blocked_clients).await,
+        "XRANGE" => cmd_xrange(args, &client, db).await,
+        "XREAD"  => cmd_xread(args, &client, db, blocked_clients).await,
+        "INCR"   => cmd_incr(args, &client, db).await,
+        "MULTI"  => cmd_multi(&client).await,
+        "EXEC"   => todo!(),
+        _        => cmd_other(cmd_name, args, &client)
     }
 }
 
@@ -1085,6 +1108,7 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
     let db = Database::default();
     let blocked_clients = BlockedClients::default();
+    let queued_commands = QueuedCommands::default();
     
     // Event loop
     loop {
@@ -1092,7 +1116,11 @@ async fn main() {
         let (socket, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = socket.into_split();
         let (tx, mut rx) = unbounded_channel();
-        let client = Client { id: get_next_id(), tx };
+        let client = Client {
+            id: get_next_id(),
+            tx,
+            in_transaction: Arc::new(Mutex::new(false))
+        };
 
         // Tokio-runtime write task
         tokio::spawn(async move {
@@ -1105,14 +1133,17 @@ async fn main() {
         // Tokio-runtime read task
         let tokio_db = db.clone();
         let tokio_blocked_clients = blocked_clients.clone();
+        let tokio_queued_commands = queued_commands.clone();
         tokio::spawn(async move {
             let mut buf = vec![0; 1024];
 
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => return, // Connection closed
-                    Ok(n) => process_cmd(&buf[0..n], &client, tokio_db.clone(),
-                                         tokio_blocked_clients.clone()).await,
+                    Ok(n) => process_cmd(&buf[0..n], &client,
+                                         tokio_db.clone(),
+                                         tokio_blocked_clients.clone(),
+                                         tokio_queued_commands.clone()).await,
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         return;

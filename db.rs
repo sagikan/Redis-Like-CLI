@@ -20,6 +20,8 @@ pub type Database = Arc<Mutex<HashMap<String, Value>>>;
 
 pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
 
+pub type QueuedCommands = Arc<Mutex<HashMap<Client, Vec<Command>>>>;
+
 #[derive(Clone)]
 pub enum ValueType {
     String(String),
@@ -32,6 +34,12 @@ pub enum EntryIdType {
     Full(()),
     Partial(u64),
     Explicit((u64, u64))
+}
+
+#[derive(Clone)]
+pub struct Command {
+    pub name: String,
+    pub args: Option<Vec<String>>
 }
 
 #[derive(Clone)]
@@ -49,7 +57,8 @@ pub struct Stream {
 #[derive(Clone)]
 pub struct Client {
     pub id: u64,
-    pub tx: UnboundedSender<Vec<u8>>
+    pub tx: UnboundedSender<Vec<u8>>,
+    pub in_transaction: Arc<Mutex<bool>>
 }
 
 #[derive(Clone)]
