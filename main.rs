@@ -1001,6 +1001,46 @@ async fn cmd_xread(parsed_cmd: &Vec<String>, client: &Client, db: Database,
     }
 }
 
+async fn cmd_incr(parsed_cmd: &Vec<String>, client: &Client, db: Database) {
+    if parsed_cmd.len() != 2 {
+        client.tx.send(b"-ERR wrong number of arguments for 'incr' command\r\n".to_vec()).unwrap();
+        return;
+    }
+
+    let key = &parsed_cmd[1];
+
+    let mut guard = db.lock().await;
+    let incr_val: String = match guard.get_mut(key) {
+        Some(value) => match &value.val {
+            ValueType::String(val) => match val.parse::<i32>() {
+                Ok(parsed_val) => {
+                    // Increase + set new value
+                    let res = (parsed_val + 1).to_string();
+                    value.val = ValueType::String(res.clone());
+                    
+                    res
+                }, Err(_) => { // Not an integer
+                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                    return;
+                }
+            }, _ => { // Value is of the wrong type
+                client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                return;
+            }
+        }, None => { // Key doesn't exist
+            // Set value to 1 + insert pair
+            let res = "1".to_string();
+            let value = Value { val: ValueType::String(res.clone()) };
+            guard.insert(key.clone(), value);
+            
+            res
+        }
+    };
+
+    // Emit new value
+    client.tx.send(format!(":{incr_val}\r\n").as_bytes().to_vec()).unwrap();
+}
+
 fn cmd_other(parsed_cmd: &Vec<String>, client: &Client) {
     // Build + emit error string
     let mut err_str = format!("-ERR unknown command '{}', with args beginning with: ", parsed_cmd[0]);
@@ -1034,6 +1074,7 @@ async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
         "XADD"   => cmd_xadd(&parsed_cmd, &client, db, blocked_clients).await,
         "XRANGE" => cmd_xrange(&parsed_cmd, &client, db).await,
         "XREAD"  => cmd_xread(&parsed_cmd, &client, db, blocked_clients).await,
+        "INCR"   => cmd_incr(&parsed_cmd, &client, db).await,
         _        => cmd_other(&parsed_cmd, &client)
     }
 }
