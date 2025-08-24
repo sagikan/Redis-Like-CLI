@@ -5,11 +5,12 @@ use std::cmp::min;
 use tokio::sync::MutexGuard;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
+use crate::client::{Client, BlockedClient, Response};
 
 fn set_pair(key: String, value: Value, client: &Client,
             mut guard: MutexGuard<'_, HashMap<String, Value>>) {
     guard.insert(key, value);
-    client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+    client.tx.send(Response::Ok.into()).unwrap();
 }
 
 async fn validate_added_entry_id(
@@ -19,8 +20,8 @@ async fn validate_added_entry_id(
         return Some(EntryIdType::Full(()));
     }
     
-    let invalid_id = |msg: &[u8]| {
-        client.tx.send(msg.to_vec()).unwrap();
+    let invalid_id = |response: Response| {
+        client.tx.send(response.into()).unwrap();
         None
     };
 
@@ -31,7 +32,7 @@ async fn validate_added_entry_id(
                 (Ok(ms_time), Ok(seq_num)) => { // Explicit
                     // Invalidate 0-0
                     if (ms_time, seq_num) == (0, 0) {
-                        invalid_id(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+                        invalid_id(Response::ErrEntryIdZero)
                     } else if let Some(last_entry) = get_last_entry(
                         db.clone(), &stream_key
                     ).await {
@@ -39,7 +40,7 @@ async fn validate_added_entry_id(
                         if ms_time < last_entry.ms_time
                            || (ms_time == last_entry.ms_time
                                && seq_num <= last_entry.seq_num) {
-                            invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                            invalid_id(Response::ErrEntryIdEqualOrSmall)
                         } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
                     } else { Some(EntryIdType::Explicit((ms_time, seq_num))) }
                 }, (Ok(ms_time), _) if seq_num == "*" => { // Partial
@@ -48,12 +49,12 @@ async fn validate_added_entry_id(
                         db.clone(), &stream_key
                     ).await {
                         if ms_time < last_entry.ms_time {
-                            invalid_id(b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n")
+                            invalid_id(Response::ErrEntryIdEqualOrSmall)
                         } else { Some(EntryIdType::Partial(ms_time)) }
                     } else { Some(EntryIdType::Partial(ms_time)) }
-                }, _ => invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+                }, _ => invalid_id(Response::ErrEntryIdInvalid)
             }
-        }, None => invalid_id(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+        }, None => invalid_id(Response::ErrEntryIdInvalid)
     }
 }
 
@@ -65,7 +66,7 @@ async fn validate_read_entry_id<F: Fn(&String) -> bool>(
     }
 
     let invalid_id = || {
-        client.tx.send(b"-ERR Invalid stream ID specified as stream command argument\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrEntryIdInvalid.into()).unwrap();
         None
     };
 
@@ -129,7 +130,7 @@ fn gen_ms() -> u64 {
     // Return the current UNIX time in ms
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(t) => t.as_millis() as u64,
-        Err(_) => panic!("You're a time traveller, Harry!")
+        _ => panic!("You're a time traveller, Harry!")
     }
 }
 
@@ -150,9 +151,9 @@ async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
 fn cmd_echo(args: Vec<String>, client: &Client) {
     if let Some(_val) = args.get(0) {
         let to_write = format!("+{}\r\n", args[0..].join(" "));
-        client.tx.send(to_write.as_bytes().to_vec()).unwrap();
+        client.tx.send(to_write.into_bytes()).unwrap();
     } else {
-        client.tx.send(b"-ERR wrong number of arguments for 'echo' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
     }
 }
 
@@ -172,8 +173,8 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
                 args[2].to_uppercase().as_str(), guard.contains_key(&key)
             ) {
                 ("NX", false) | ("XX", true) => set_pair(key, value, &client, guard),
-                ("NX", true) | ("XX", false) => client.tx.send(b"$-1\r\n".to_vec()).unwrap(),
-                _ => client.tx.send(b"-ERR syntax error\r\n".to_vec()).unwrap()
+                ("NX", true) | ("XX", false) => client.tx.send(Response::Nil.into()).unwrap(),
+                _ => client.tx.send(Response::ErrSyntax.into()).unwrap()
             }
         }, 4 => { // [Key] [Value] [EX / PX] [Stringified Number]
             match args[2].to_uppercase().as_str() {
@@ -182,7 +183,7 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
                     let timeout = match args[3].parse::<u64>() {
                         Ok(t) if t > 0 => if arg == "EX" { t * 1000 } else { t },
                         _ => {
-                            client.tx.send(b"-ERR invalid expire time in 'set' command\r\n".to_vec()).unwrap();
+                            client.tx.send(Response::ErrSetExpireTime.into()).unwrap();
                             return;
                         }
                     };
@@ -197,15 +198,15 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
                         sleep(Duration::from_millis(timeout as u64)).await;
                         tokio_db.lock().await.remove(&key);
                     });
-                }, _ => client.tx.send(b"-ERR syntax error\r\n".to_vec()).unwrap()
+                }, _ => client.tx.send(Response::ErrSyntax.into()).unwrap()
             }
-        }, _ => client.tx.send(b"-ERR wrong number of arguments for 'set' command\r\n".to_vec()).unwrap()
+        }, _ => client.tx.send(Response::ErrArgCount.into()).unwrap()
     }
 }
 
 async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 1 {
-        client.tx.send(b"-ERR wrong number of arguments for 'get' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -215,18 +216,18 @@ async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
             ValueType::String(val) => val.clone(),
             _ => { panic!("Extraction Error"); }
         }, None => {
-            client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
+            client.tx.send(Response::Nil.into()).unwrap();
             return;
         }
     };
 
-    client.tx.send(format!("+{val}\r\n").as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("+{val}\r\n").into_bytes()).unwrap();
 }
 
 async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
                   db: Database, blocked_clients: BlockedClients) {
     if args.len() < 2 {
-        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -261,9 +262,9 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
                 };
 
                 // Emit key + popped value
-                front_client.client.tx.send(format!("*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
-                                                    key.len(), val.len())
-                                            .as_bytes().to_vec()).unwrap();
+                front_client.client.tx.send(format!(
+                    "*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
+                ).into_bytes()).unwrap();
                 
                 to_unblock.push(front_client);
             }
@@ -298,7 +299,7 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
 
                 stored_val_list.len()
             }, _ => { // Value is of the wrong type
-                client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                client.tx.send(Response::WrongType.into()).unwrap();
                 return;
             }
         }, None => {
@@ -313,14 +314,14 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
     };
     
     // Emit the list's length
-    client.tx.send(format!(":{stored_val_list_len}\r\n").as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{stored_val_list_len}\r\n").into_bytes()).unwrap();
 }
 
 async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
                  db: Database) {
     let args_len = args.len();
     if args_len != 1 && args_len != 2 {
-        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -331,7 +332,7 @@ async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
         2 => match args[1].parse::<u64>() {
             Ok(v) => v,
             _ => {
-                client.tx.send(b"-ERR value is out of range, must be positive\r\n".to_vec()).unwrap();
+                client.tx.send(Response::ErrOutOfRange.into()).unwrap();
                 return;
             }
         }, _ => 0
@@ -352,22 +353,24 @@ async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
                     1 => match my_pop() {
                         Some(v) => format!("+{v}\r\n"),
                         None => return
-                    }, _ => format!("*{pop_num_usize}\r\n{}",
-                                (0..pop_num_usize) // For [pop_num_usize] times
-                                    .filter_map(|_| my_pop()) // Pop -> filter -> map popped values
-                                    .map(|val| format!("${}\r\n{val}\r\n", val.len())) // Stringify
-                                    .collect::<String>()) // Unify to one string
+                    }, _ => format!(
+                        "*{pop_num_usize}\r\n{}",
+                        (0..pop_num_usize) // For [pop_num_usize] times
+                            .filter_map(|_| my_pop()) // Pop -> filter -> map popped value
+                            .map(|val| format!("${}\r\n{val}\r\n", val.len())) // Stringify
+                            .collect::<String>() // Unify to one string
+                    ) 
                 };
 
-                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+                client.tx.send(bulk_str.into_bytes()).unwrap();
 
                 // Remove key if popped all values
                 if pop_num_usize == val_list_len {
                     guard.remove(key);
                 }
             }, // Value is of the wrong type
-            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
-        }, None => client.tx.send(b"$-1\r\n".to_vec()).unwrap()
+            _ => client.tx.send(Response::WrongType.into()).unwrap()
+        }, None => client.tx.send(Response::Nil.into()).unwrap()
     }    
 }
 
@@ -375,7 +378,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
                   db: Database, blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 2 {
-        client.tx.send(b"-ERR wrong number of arguments for command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -392,15 +395,16 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
                         true => val_list.pop_back().unwrap(),
                         false => val_list.pop_front().unwrap()
                     }, _ => { // Value is of the wrong type
-                        client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                        client.tx.send(Response::WrongType.into()).unwrap();
                         return;
                     }
                 }, None => { continue; } // Skip
             };
 
             // Emit key + popped value array
-            client.tx.send(format!("*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n",
-                                   key.len(), val.len()).as_bytes().to_vec()).unwrap();
+            client.tx.send(format!(
+                "*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
+            ).into_bytes()).unwrap();
             return;
         }
     }
@@ -426,7 +430,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
     let block = match args[args_len-1].parse::<f64>() {
         Ok(v) if v >= 0.0 => v,
         _ => {
-            client.tx.send(b"-ERR timeout is negative\r\n".to_vec()).unwrap();
+            client.tx.send(Response::ErrNegativeTimeout.into()).unwrap();
             return;
         }
     };
@@ -453,7 +457,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
             }
 
             if still_blocked {
-                tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
+                tokio_client.tx.send(Response::Nil.into()).unwrap();
             }
         });
     }
@@ -461,7 +465,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
 
 async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 3 {
-        client.tx.send(b"-ERR wrong number of arguments for 'lrange' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -473,7 +477,7 @@ async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
     ) {
         (Ok(start), Ok(stop)) => (start, stop),
         _ => {
-            client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+            client.tx.send(Response::ErrNotInteger.into()).unwrap();
             return;
         }
     };
@@ -492,7 +496,7 @@ async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
                 stop = min(stop, val_list_len - 1);
 
                 if start > stop { // Invalid post-adjustment
-                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
+                    client.tx.send(Response::EmptyArray.into()).unwrap();
                     return;
                 }
 
@@ -504,16 +508,16 @@ async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
                     bulk_str.push_str(&format!("${}\r\n{val}\r\n", val.len()));
                 }
 
-                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+                client.tx.send(bulk_str.into_bytes()).unwrap();
             }, // Value is of the wrong type
-            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
-        }, None => client.tx.send(b"*0\r\n".to_vec()).unwrap() // Empty array
+            _ => client.tx.send(Response::WrongType.into()).unwrap()
+        }, None => client.tx.send(Response::EmptyArray.into()).unwrap()
     }
 }
 
 async fn cmd_llen(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 1 {
-        client.tx.send(b"-ERR wrong number of arguments for 'llen' command".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -522,19 +526,19 @@ async fn cmd_llen(args: Vec<String>, client: &Client, db: Database) {
             // An existing list is found
             ValueType::StringList(val_list) => val_list.len(),
             _ => { // Value is of the wrong type
-                client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                client.tx.send(Response::WrongType.into()).unwrap();
                 return;
             }
-        }, None => 0 // Key doesn't exist (and hence a list)
+        }, None => 0 // Key doesn't exist
     };
 
     // Emit the list's length
-    client.tx.send(format!(":{val_list_len}\r\n").as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{val_list_len}\r\n").into_bytes()).unwrap();
 }
 
 async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 1 {
-        client.tx.send(b"-ERR wrong number of arguments for 'type' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
     
@@ -546,14 +550,14 @@ async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
         }, None => "none"
     };
 
-    client.tx.send(format!("+{val_type}\r\n").as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("+{val_type}\r\n").into_bytes()).unwrap();
 }
 
 async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                   blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 4 || args_len % 2 == 1 {
-        client.tx.send(b"-ERR wrong number of arguments for 'xadd' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -593,7 +597,7 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                 // An existing stream is found
                 ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
                 // Value is of the wrong type
-                _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+                _ => client.tx.send(Response::WrongType.into()).unwrap()
             }, None => {
                 let entries = Entries::default();
                 // Insert entry + create stream
@@ -623,14 +627,17 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                             ValueType::Stream(stream) => { // An existing stream is found
                                 let (ms_time_, seq_num_) = match blocked_client.from_entry_id {
                                     Some((ms, seq)) => (ms, seq),
-                                    None => { break 'outer; } // Not blocked by XREAD operation
+                                    None => { break 'outer; } // Not blocked by XREAD
                                 };
-                                let f_e: Vec<Entry> = stream.entries.lock().await.iter().filter(
-                                    |e| ms_time_ < e.ms_time
-                                        || (ms_time_ == e.ms_time && seq_num_ < e.seq_num)
-                                ).take(
-                                    blocked_client.count.map(|c| c as usize).unwrap_or(usize::MAX)
-                                ).cloned().collect();
+                                let f_e: Vec<Entry> = stream.entries.lock().await.iter()
+                                    .filter(
+                                        |e| ms_time_ < e.ms_time
+                                            || (ms_time_ == e.ms_time && seq_num_ < e.seq_num)
+                                    ).take(
+                                        blocked_client.count
+                                            .map(|c| c as usize)
+                                            .unwrap_or(usize::MAX) // Take all if no count
+                                    ).cloned().collect();
 
                                 if f_e.is_empty() { continue; } // No following entries
                                 with_following_entries += 1;
@@ -643,17 +650,21 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                     // Iterate over entries
                     for entry in following_entries {
                         let entry_id = format!("{}-{}", entry.ms_time, entry.seq_num);
-                        bulk_str.push_str(&format!("*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
-                                                   entry_id.len(), entry.fields.len() * 2));
+                        bulk_str.push_str(&format!(
+                            "*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
+                            entry_id.len(), entry.fields.len() * 2
+                        ));
                         // Iterate over entry's fields
                         for (f_key, f_val) in entry.fields.iter() {
-                            bulk_str.push_str(&format!("${}\r\n{f_key}\r\n${}\r\n{f_val}\r\n",
-                                                       f_key.len(), f_val.len()));
+                            bulk_str.push_str(&format!(
+                                "${}\r\n{f_key}\r\n${}\r\n{f_val}\r\n",
+                                f_key.len(), f_val.len()
+                            ));
                         }
                     }
                 }
                 bulk_str = format!("*{with_following_entries}\r\n{bulk_str}");
-                blocked_client.client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+                blocked_client.client.tx.send(bulk_str.into_bytes()).unwrap();
 
                 to_unblock.push(blocked_client.clone());
             }
@@ -673,13 +684,14 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
 
     // Emit the entry ID
     let entry_id = format!("{ms_time}-{seq_num}");
-    client.tx.send(format!("${}\r\n{entry_id}\r\n", entry_id.len())
-                   .as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(
+        "${}\r\n{entry_id}\r\n", entry_id.len()
+    ).into_bytes()).unwrap();
 }
 
 async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 3 {
-        client.tx.send(b"-ERR wrong number of arguments for 'xrange' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -692,7 +704,7 @@ async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
             match get_first_entry(db.clone(), &stream_key).await {
                 Some(e) => (e.ms_time, e.seq_num),
                 None => { // No entries
-                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
+                    client.tx.send(Response::EmptyArray.into()).unwrap();
                     return;
                 }
             }
@@ -708,7 +720,7 @@ async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
             match get_last_entry(db.clone(), &stream_key).await {
                 Some(e) => (e.ms_time, e.seq_num),
                 None => { // No entries
-                    client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
+                    client.tx.send(Response::EmptyArray.into()).unwrap();
                     return;
                 }
             }
@@ -728,7 +740,7 @@ async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
 
     // Range not sequential
     if s_ms_time > e_ms_time || (s_ms_time == e_ms_time && s_seq_num > e_seq_num) {
-        client.tx.send(b"*0\r\n".to_vec()).unwrap(); // Empty array
+        client.tx.send(Response::EmptyArray.into()).unwrap();
         return;
     }
 
@@ -747,18 +759,21 @@ async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
                 // Iterate over entries
                 for entry in ranged {
                     let e_id = format!("{}-{}", entry.ms_time, entry.seq_num);
-                    bulk_str.push_str(&format!("*2\r\n${}\r\n{e_id}\r\n*{}\r\n",
-                                               e_id.len(), entry.fields.len() * 2));
+                    bulk_str.push_str(&format!(
+                        "*2\r\n${}\r\n{e_id}\r\n*{}\r\n",
+                        e_id.len(), entry.fields.len() * 2
+                    ));
                     // Iterate over entry's fields
                     for (key, val) in entry.fields.iter() {
-                        bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n",
-                                                   key.len(), val.len()));
+                        bulk_str.push_str(&format!(
+                            "${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
+                        ));
                     }
                 }
 
-                client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+                client.tx.send(bulk_str.into_bytes()).unwrap();
             }, // Value is of the wrong type
-            _ => client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap()
+            _ => client.tx.send(Response::WrongType.into()).unwrap()
         }
     }
 }
@@ -767,7 +782,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
                    blocked_clients: BlockedClients) {
     let args_len = args.len();
     let wrong_args_len = || {
-        client.tx.send(b"-ERR wrong number of arguments for 'xread' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     };
     if args_len < 3 || args_len % 2 == 0 { wrong_args_len(); }
@@ -790,7 +805,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
             ) {
                 (Ok(c), Ok(b)) => (c, b),
                 _ => {
-                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                    client.tx.send(Response::ErrNotInteger.into()).unwrap();
                     return;
                 }
             };
@@ -805,7 +820,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
             let x = match args[1].parse::<u64>() { // Value of count / block
                 Ok(x) => x,
                 _ => {
-                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                    client.tx.send(Response::ErrNotInteger.into()).unwrap();
                     return;
                 }
             };
@@ -825,7 +840,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
 
             (None, None, s_k, e_i)
         }, _ => {
-            client.tx.send(b"-ERR syntax error".to_vec()).unwrap();
+            client.tx.send(Response::ErrSyntax.into()).unwrap();
             return;
         }
     };
@@ -895,7 +910,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
 
                         f_e
                     }, _ => { // Value is of the wrong type
-                        client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                        client.tx.send(Response::WrongType.into()).unwrap();
                         return;
                     }
                 }, None => { // Key doesn't exist
@@ -903,17 +918,21 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
                     continue;
                 }
             };
-            bulk_str.push_str(&format!("*2\r\n${}\r\n{stream_key}\r\n*1\r\n",
-                                       stream_key.len()));
+            bulk_str.push_str(&format!(
+                "*2\r\n${}\r\n{stream_key}\r\n*1\r\n", stream_key.len()
+            ));
             // Iterate over entries
             for entry in following_entries {
                 let entry_id = format!("{}-{}", entry.ms_time, entry.seq_num);
-                bulk_str.push_str(&format!("*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
-                                           entry_id.len(), entry.fields.len() * 2));
+                bulk_str.push_str(&format!(
+                    "*2\r\n${}\r\n{entry_id}\r\n*{}\r\n",
+                    entry_id.len(), entry.fields.len() * 2
+                ));
                 // Iterate over entry's fields
                 for (key, val) in entry.fields.iter() {
-                    bulk_str.push_str(&format!("${}\r\n{key}\r\n${}\r\n{val}\r\n",
-                                               key.len(), val.len()));
+                    bulk_str.push_str(&format!(
+                        "${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
+                    ));
                 }
             }
         }
@@ -959,19 +978,19 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
                 }
 
                 if still_blocked {
-                    tokio_client.tx.send(b"$-1\r\n".to_vec()).unwrap(); // (nil)
+                    tokio_client.tx.send(Response::Nil.into()).unwrap();
                 }
             });
         }
     } else { // Synchronous
         bulk_str = format!("*{}\r\n{bulk_str}", stream_keys.len() - no_following_entries);
-        client.tx.send(bulk_str.as_bytes().to_vec()).unwrap();
+        client.tx.send(bulk_str.into_bytes()).unwrap();
     }
 }
 
 async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 1 {
-        client.tx.send(b"-ERR wrong number of arguments for 'incr' command\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
@@ -987,12 +1006,12 @@ async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
                     value.val = ValueType::String(res.clone());
                     
                     res
-                }, Err(_) => { // Not an integer
-                    client.tx.send(b"-ERR value is not an integer or out of range\r\n".to_vec()).unwrap();
+                }, _ => {
+                    client.tx.send(Response::ErrNotInteger.into()).unwrap();
                     return;
                 }
             }, _ => { // Value is of the wrong type
-                client.tx.send(b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n".to_vec()).unwrap();
+                client.tx.send(Response::WrongType.into()).unwrap();
                 return;
             }
         }, None => { // Key doesn't exist
@@ -1006,34 +1025,33 @@ async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
     };
 
     // Emit new value
-    client.tx.send(format!(":{incr_val}\r\n").as_bytes().to_vec()).unwrap();
+    client.tx.send(format!(":{incr_val}\r\n").into_bytes()).unwrap();
 }
 
 async fn cmd_multi(client: &Client) {
     let mut in_transaction = client.in_transaction.lock().await;
     if *in_transaction {
-        client.tx.send(b"-ERR MULTI calls can not be nested\r\n".to_vec()).unwrap();
+        client.tx.send(Response::ErrNestedMulti.into()).unwrap();
         return;
     }
     *in_transaction = true; // Start transaction
 
-    client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+    client.tx.send(Response::Ok.into()).unwrap();
 }
 
 async fn cmd_exec(client: &Client, db: Database, blocked_clients: BlockedClients) {
     {
         let mut in_transaction = client.in_transaction.lock().await;
         if !*in_transaction {
-            client.tx.send(b"-ERR EXEC without MULTI\r\n".to_vec()).unwrap();
+            client.tx.send(Response::ErrExecWithoutMulti.into()).unwrap();
             return;
         }
         *in_transaction = false; // End transaction
     }
 
-    let queue: Vec<Command> = client.queued_commands.lock().await
-                                                    .drain(..).collect();
+    let queue: Vec<Command> = client.queued_commands.lock().await.drain(..).collect();
     // Emit array length
-    client.tx.send(format!("*{}\r\n", queue.len()).as_bytes().to_vec()).unwrap();
+    client.tx.send(format!("*{}\r\n", queue.len()).into_bytes()).unwrap();
     // Execute queued commands
     for mut cmd in queue {
         // Box::pin for recursion warning
@@ -1045,7 +1063,7 @@ async fn cmd_discard(client: &Client) {
     {
         let mut in_transaction = client.in_transaction.lock().await;
         if !*in_transaction {
-            client.tx.send(b"-ERR DISCARD without MULTI\r\n".to_vec()).unwrap();
+            client.tx.send(Response::ErrDiscardWithoutMulti.into()).unwrap();
             return;
         }
         *in_transaction = false; // End transaction
@@ -1054,7 +1072,7 @@ async fn cmd_discard(client: &Client) {
     // Empty command queue
     client.queued_commands.lock().await.clear();
 
-    client.tx.send(b"+OK\r\n".to_vec()).unwrap();
+    client.tx.send(Response::Ok.into()).unwrap();
 }
 
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
@@ -1065,7 +1083,7 @@ fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
     }
     err_str.push_str("\r\n");
 
-    client.tx.send(err_str.as_bytes().to_vec()).unwrap();
+    client.tx.send(err_str.into_bytes()).unwrap();
 }
 
 #[derive(Clone)]
@@ -1079,11 +1097,12 @@ impl Command {
                          blocked_clients: BlockedClients) {
         let uc_name = self.name.to_uppercase();
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
-        // Queue a non-EXEC/DISCARD command if in transaction mode
+
+        // Queue non-EXEC/DISCARD command if in transaction mode
         if *client.in_transaction.lock().await
            && !transactional_cmds.contains(&uc_name.as_str()) {
             client.queued_commands.lock().await.push(self.clone());
-            client.tx.send(b"+QUEUED\r\n".to_vec()).unwrap();
+            client.tx.send(Response::Queued.into()).unwrap();
             return;
         }
 
@@ -1091,7 +1110,7 @@ impl Command {
         let args = self.args.take().unwrap_or_else(Vec::new);
 
         match uc_name.as_str() {
-            "PING"    => client.tx.send(b"+PONG\r\n".to_vec()).unwrap(),
+            "PING"    => client.tx.send(Response::Pong.into()).unwrap(),
             "ECHO"    => cmd_echo(args, &client),
             "SET"     => cmd_set(args, &client, db).await,
             "GET"     => cmd_get(args, &client, db).await,

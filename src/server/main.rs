@@ -1,4 +1,5 @@
 mod db;
+mod client;
 mod commands;
 
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use crate::db::*;
+use crate::client::{get_next_id, Client, Response};
 use crate::commands::Command;
 
 fn parse_resp(to_parse: &[u8]) -> Option<Command> {
@@ -43,7 +45,7 @@ async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
     let mut cmd: Command = match parse_resp(cmd) {
         Some(cmd) => cmd,
         None => { // Empty command
-            client.tx.send(b"-ERR unknown command ''".to_vec()).unwrap();
+            client.tx.send(Response::ErrEmptyCommand.into()).unwrap();
             return;
         }
     };
