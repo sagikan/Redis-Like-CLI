@@ -5,6 +5,7 @@ use std::cmp::min;
 use tokio::sync::MutexGuard;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
+use crate::config::{Config, ReplState};
 use crate::client::{Client, BlockedClient, Response};
 
 fn set_pair(key: String, value: Value, client: &Client,
@@ -1039,7 +1040,8 @@ async fn cmd_multi(client: &Client) {
     client.tx.send(Response::Ok.into()).unwrap();
 }
 
-async fn cmd_exec(client: &Client, db: Database, blocked_clients: BlockedClients) {
+async fn cmd_exec(client: &Client, config: Config, repl_state: ReplState,
+                  db: Database, blocked_clients: BlockedClients) {
     {
         let mut in_transaction = client.in_transaction.lock().await;
         if !*in_transaction {
@@ -1055,7 +1057,9 @@ async fn cmd_exec(client: &Client, db: Database, blocked_clients: BlockedClients
     // Execute queued commands
     for mut cmd in queue {
         // Box::pin for recursion warning
-        Box::pin(cmd.execute(&client, db.clone(), blocked_clients.clone())).await;
+        Box::pin(cmd.execute(
+                &client, config.clone(), repl_state.clone(), db.clone(), blocked_clients.clone()
+        )).await;
     }
 }
 
@@ -1073,6 +1077,20 @@ async fn cmd_discard(client: &Client) {
     client.queued_commands.lock().await.clear();
 
     client.tx.send(Response::Ok.into()).unwrap();
+}
+
+async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state: ReplState) {
+    let info_str: Vec<u8> = match args.len() {
+        0 => { todo!(); }, // Default
+        1 => { // [Section]
+            match args[0].to_uppercase().as_str() {
+                "REPLICATION" => config.get_replication(repl_state),
+                _ => todo!()
+            }
+        }, _ => Response::WrongType.into()
+    };
+
+    client.tx.send(info_str).unwrap();
 }
 
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
@@ -1093,8 +1111,8 @@ pub struct Command {
 }
 
 impl Command {
-    pub async fn execute(&mut self, client: &Client, db: Database,
-                         blocked_clients: BlockedClients) {
+    pub async fn execute(&mut self, client: &Client, config: Config, repl_state: ReplState,
+                         db: Database, blocked_clients: BlockedClients) {
         let uc_name = self.name.to_uppercase();
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
 
@@ -1128,8 +1146,9 @@ impl Command {
             "XREAD"   => cmd_xread(args, &client, db, blocked_clients).await,
             "INCR"    => cmd_incr(args, &client, db).await,
             "MULTI"   => cmd_multi(&client).await,
-            "EXEC"    => cmd_exec(&client, db, blocked_clients).await,
+            "EXEC"    => cmd_exec(&client, config, repl_state, db, blocked_clients).await,
             "DISCARD" => cmd_discard(&client).await,
+            "INFO"    => cmd_info(args, &client, config, repl_state, ).await,
             _         => cmd_other(&self.name, args, &client)
         }
     }

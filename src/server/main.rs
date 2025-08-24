@@ -1,13 +1,16 @@
 mod db;
+mod config;
 mod client;
 mod commands;
 
+use std::env;
 use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use crate::db::*;
+use crate::config::{Config, Config_, ReplState};
 use crate::client::{get_next_id, Client, Response};
 use crate::commands::Command;
 
@@ -40,8 +43,8 @@ fn parse_resp(to_parse: &[u8]) -> Option<Command> {
     })
 }
 
-async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
-                     blocked_clients: BlockedClients) {
+async fn process_cmd(cmd: &[u8], client: &Client, config: Config, repl_state: ReplState,
+                     db: Database, blocked_clients: BlockedClients) {
     let mut cmd: Command = match parse_resp(cmd) {
         Some(cmd) => cmd,
         None => { // Empty command
@@ -50,16 +53,22 @@ async fn process_cmd(cmd: &[u8], client: &Client, db: Database,
         }
     };
 
-    cmd.execute(&client, db, blocked_clients).await; 
+    cmd.execute(&client, config, repl_state, db, blocked_clients).await; 
 }
 
 #[tokio::main]
 async fn main() {
-    // Set listener to port 6379 + maps
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    // Set server configuration + DBs
+    let config = Arc::new(Config_::from(env::args().skip(1).collect()));
+    let repl_state = ReplState::default();
     let db = Database::default();
     let blocked_clients = BlockedClients::default();
-    
+
+    // Set listener
+    let listener = TcpListener::bind(format!(
+        "{}:{}", config.bind_addr, config.port
+    )).await.unwrap();
+
     // Event loop
     loop {
         // Accept client
@@ -82,6 +91,8 @@ async fn main() {
         });
 
         // Tokio-runtime read task
+        let tokio_config = config.clone();
+        let tokio_repl_state = repl_state.clone();
         let tokio_db = db.clone();
         let tokio_blocked_clients = blocked_clients.clone();
         tokio::spawn(async move {
@@ -90,8 +101,14 @@ async fn main() {
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => return, // Connection closed
-                    Ok(n) => process_cmd(&buf[0..n], &client, tokio_db.clone(),
-                                         tokio_blocked_clients.clone()).await,
+                    Ok(n) => process_cmd(
+                        &buf[0..n],
+                        &client,
+                        tokio_config.clone(),
+                        tokio_repl_state.clone(),
+                        tokio_db.clone(),
+                        tokio_blocked_clients.clone()
+                    ).await,
                     Err(e) => {
                         eprintln!("Error: {}", e);
                         return;
