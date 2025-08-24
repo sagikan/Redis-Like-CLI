@@ -1093,6 +1093,18 @@ async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state
     client.tx.send(info_str).unwrap();
 }
 
+fn cmd_replconf(_args: Vec<String>, client: &Client, _config: Config, _repl_state: ReplState) {
+    // TODO: Implementation
+    
+    client.tx.send(Response::Ok.into()).unwrap();
+}
+
+fn cmd_psync(client: &Client, repl_state: ReplState) {
+    client.tx.send(format!(
+        "+FULLRESYNC {} {}\r\n", repl_state.replid, repl_state.repl_offset
+    ).into_bytes()).unwrap();
+}
+
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
     // Build + emit error string
     let mut err_str = format!("-ERR unknown command '{cmd_name}', with args beginning with: ");
@@ -1128,28 +1140,30 @@ impl Command {
         let args = self.args.take().unwrap_or_else(Vec::new);
 
         match uc_name.as_str() {
-            "PING"    => client.tx.send(Response::Pong.into()).unwrap(),
-            "ECHO"    => cmd_echo(args, &client),
-            "SET"     => cmd_set(args, &client, db).await,
-            "GET"     => cmd_get(args, &client, db).await,
-            "RPUSH"   => cmd_push(true, args, &client, db, blocked_clients).await,
-            "LPUSH"   => cmd_push(false, args, &client, db, blocked_clients).await,
-            "RPOP"    => cmd_pop(true, args, &client, db).await,
-            "LPOP"    => cmd_pop(false, args, &client, db).await,
-            "BRPOP"   => cmd_bpop(true, args, &client, db, blocked_clients).await,
-            "BLPOP"   => cmd_bpop(false, args, &client, db, blocked_clients).await,
-            "LRANGE"  => cmd_lrange(args, &client, db).await,
-            "LLEN"    => cmd_llen(args, &client, db).await,
-            "TYPE"    => cmd_type(args, &client, db).await,
-            "XADD"    => cmd_xadd(args, &client, db, blocked_clients).await,
-            "XRANGE"  => cmd_xrange(args, &client, db).await,
-            "XREAD"   => cmd_xread(args, &client, db, blocked_clients).await,
-            "INCR"    => cmd_incr(args, &client, db).await,
-            "MULTI"   => cmd_multi(&client).await,
-            "EXEC"    => cmd_exec(&client, config, repl_state, db, blocked_clients).await,
-            "DISCARD" => cmd_discard(&client).await,
-            "INFO"    => cmd_info(args, &client, config, repl_state, ).await,
-            _         => cmd_other(&self.name, args, &client)
+            "PING"     => client.tx.send(Response::Pong.into()).unwrap(),
+            "ECHO"     => cmd_echo(args, &client),
+            "SET"      => cmd_set(args, &client, db).await,
+            "GET"      => cmd_get(args, &client, db).await,
+            "RPUSH"    => cmd_push(true, args, &client, db, blocked_clients).await,
+            "LPUSH"    => cmd_push(false, args, &client, db, blocked_clients).await,
+            "RPOP"     => cmd_pop(true, args, &client, db).await,
+            "LPOP"     => cmd_pop(false, args, &client, db).await,
+            "BRPOP"    => cmd_bpop(true, args, &client, db, blocked_clients).await,
+            "BLPOP"    => cmd_bpop(false, args, &client, db, blocked_clients).await,
+            "LRANGE"   => cmd_lrange(args, &client, db).await,
+            "LLEN"     => cmd_llen(args, &client, db).await,
+            "TYPE"     => cmd_type(args, &client, db).await,
+            "XADD"     => cmd_xadd(args, &client, db, blocked_clients).await,
+            "XRANGE"   => cmd_xrange(args, &client, db).await,
+            "XREAD"    => cmd_xread(args, &client, db, blocked_clients).await,
+            "INCR"     => cmd_incr(args, &client, db).await,
+            "MULTI"    => cmd_multi(&client).await,
+            "EXEC"     => cmd_exec(&client, config, repl_state, db, blocked_clients).await,
+            "DISCARD"  => cmd_discard(&client).await,
+            "INFO"     => cmd_info(args, &client, config, repl_state, ).await,
+            "REPLCONF" => cmd_replconf(args, &client, config, repl_state),
+            "PSYNC"    => cmd_psync(&client, repl_state),
+            _          => cmd_other(&self.name, args, &client)
         }
     }
 }

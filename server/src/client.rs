@@ -31,6 +31,7 @@ pub struct BlockedClient {
 #[derive(Clone)]
 pub enum Response {
     Ok,
+    Ping,
     Pong,
     Queued,
     ErrEmptyCommand,
@@ -55,6 +56,7 @@ impl From<Response> for Vec<u8> {
     fn from(response: Response) -> Self {
         match response {
             Response::Ok => &b"+OK\r\n"[..],
+            Response::Ping => &b"*1\r\n$4\r\nPING\r\n"[..],
             Response::Pong => &b"+PONG\r\n"[..],
             Response::Queued => &b"+QUEUED\r\n"[..],
             Response::ErrEmptyCommand => &b"-ERR unknown command ''\r\n"[..],

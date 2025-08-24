@@ -4,15 +4,75 @@ mod client;
 mod commands;
 
 use std::env;
+use std::error::Error;
 use std::sync::Arc;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::Mutex;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use tokio::sync::{mpsc::unbounded_channel, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use crate::db::*;
 use crate::config::{Config, Config_, ReplState};
 use crate::client::{get_next_id, Client, Response};
 use crate::commands::Command;
+
+fn send_and_verify(
+    stream: &mut TcpStream, to_write: Vec<u8>, expected: Vec<u8>, error: &str
+)-> Result<(), Box<dyn Error>> {
+    let mut buf = [0; 256];
+
+    // Write/read to/from stream + verify reponse
+    stream.write_all(&to_write)?;
+    let bytes_read = stream.read(&mut buf)?;
+    if buf[..bytes_read] != expected[..] && !buf[..bytes_read].starts_with(&expected) {
+        return Err(error.into());
+    }
+
+    Ok(())
+}
+
+fn send_handshake(
+    master_addr: &String, master_port: u16, port: u16
+) -> Result<(), Box<dyn Error>> {
+    let mut stream = TcpStream::connect(format!("{master_addr}:{master_port}"))?;
+
+    // (1) PING
+    send_and_verify(
+        &mut stream,
+        Response::Ping.into(),
+        Response::Pong.into(),
+        "'PING' -> Master"
+    )?;
+    // (2) REPLCONF listening-port <PORT>
+    send_and_verify(
+        &mut stream,
+        format!(
+            "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n{port}\r\n"
+        ).into_bytes(),
+        Response::Ok.into(),
+        "'REPLCONF listening-port' -> Master"
+    )?;
+    // (3) REPLCONF capa psync2
+    send_and_verify(
+        &mut stream,
+        format!(
+            "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+        ).into_bytes(),
+        Response::Ok.into(),
+        "'REPLCONF capa' -> Master"
+    )?;
+    // (4) PSYNC ? -1
+    send_and_verify(
+        &mut stream,
+        format!(
+            "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+        ).into_bytes(),
+        "+FULLRESYNC".to_string().into_bytes(),
+        "'PSYNC' -> Master"
+    )?;
+    
+    Ok(())
+}
 
 fn parse_resp(to_parse: &[u8]) -> Option<Command> {
     let unparsed_str = std::str::from_utf8(to_parse).unwrap();
@@ -63,6 +123,18 @@ async fn main() {
     let repl_state = ReplState::default();
     let db = Database::default();
     let blocked_clients = BlockedClients::default();
+
+    // Send handshake to master if replica
+    if !config.is_master {
+        if let Err(e) = send_handshake(
+            config.master_addr.as_ref().unwrap(),
+            config.master_port.unwrap(),
+            config.port
+        ) {
+            eprintln!("Error: {}", e);
+            return;
+        }
+    }
 
     // Set listener
     let listener = TcpListener::bind(format!(

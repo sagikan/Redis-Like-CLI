@@ -2,6 +2,8 @@ use std::sync::Arc;
 use rand::{rng, Rng};
 use rand::distr::Alphanumeric;
 
+static DEF_PORT: u16 = 6379;
+
 pub type Config = Arc<Config_>;
 pub type ReplState = Arc<ReplState_>;
 
@@ -27,7 +29,7 @@ impl Default for Config_ {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1".to_string(),
-            port: 6379,
+            port: DEF_PORT,
             is_master: true,
             master_addr: None,
             master_port: None
@@ -48,14 +50,14 @@ impl Config_ {
                     config.bind_addr = args[i + 1].clone();
                     i += 2; // Skip
                 }, "--port" if i + 1 < args.len() => {
-                    config.port = args[i + 1].parse().unwrap_or(6379);
+                    config.port = args[i + 1].parse().unwrap_or(DEF_PORT);
                     i += 2; // Skip
                 }, "--replicaof" if i + 1 < args.len() => {
                     let split: Vec<&str> = args[i + 1].split_whitespace().collect();
                     if split.len() == 2 {
                         config.is_master = false;
                         config.master_addr = Some(split[0].to_string());
-                        config.master_port = Some(split[1].parse().unwrap_or(6379));
+                        config.master_port = Some(split[1].parse().unwrap_or(DEF_PORT));
                     }
                     i += 2; // Skip
                 }, _ => i += 1
