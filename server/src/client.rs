@@ -1,7 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedSender;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use crate::commands::Command;
 
 static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -49,7 +47,8 @@ pub enum Response {
     ErrEntryIdInvalid,
     WrongType,
     EmptyArray,
-    Nil
+    Nil,
+    EmptyRDB
 }
 
 impl From<Response> for Vec<u8> {
@@ -74,7 +73,8 @@ impl From<Response> for Vec<u8> {
             Response::ErrEntryIdInvalid => &b"-ERR Invalid stream ID specified as stream command argument\r\n"[..],
             Response::WrongType => &b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n"[..],
             Response::EmptyArray => &b"*0\r\n"[..],
-            Response::Nil => &b"$-1\r\n"[..]
+            Response::Nil => &b"$-1\r\n"[..],
+            Response::EmptyRDB => &b"524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"[..]
         }.to_vec()
     }
 }

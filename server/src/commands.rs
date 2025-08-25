@@ -1,7 +1,10 @@
+use std::error::Error;
+use std::str;
+use std::cmp::min;
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::cmp::min;
+use hex;
 use tokio::sync::MutexGuard;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
@@ -147,6 +150,13 @@ async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
         None if ms_time > 0 => 0,
         None => 1 // ms_time = 0
     }
+}
+
+fn hex_to_binary(hex_vec: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
+    let hex_str = str::from_utf8(&hex_vec)?;
+    let bin_vec = hex::decode(hex_str)?;
+
+    Ok(bin_vec)
 }
 
 fn cmd_echo(args: Vec<String>, client: &Client) {
@@ -1099,10 +1109,32 @@ fn cmd_replconf(_args: Vec<String>, client: &Client, _config: Config, _repl_stat
     client.tx.send(Response::Ok.into()).unwrap();
 }
 
-fn cmd_psync(client: &Client, repl_state: ReplState) {
+async fn cmd_psync(client: &Client, repl_state: ReplState) {
     client.tx.send(format!(
         "+FULLRESYNC {} {}\r\n", repl_state.replid, repl_state.repl_offset
     ).into_bytes()).unwrap();
+
+    // Decode an empty RDB to binary
+    let empty_rdb = match hex_to_binary(Response::EmptyRDB.into()) {
+        Ok(bin_content) => bin_content,
+        _ => { 
+            eprintln!("Couldn't resync replica");
+            return;
+        }
+    };
+
+    // Build + emit RDB file to replica
+    let mut bulk_str = Vec::new();
+    bulk_str.extend_from_slice(format!("${}\r\n", empty_rdb.len()).as_bytes());
+    bulk_str.extend_from_slice(&empty_rdb);
+
+    client.tx.send(bulk_str).unwrap();
+
+    // Store replica's sender
+    let mut replicas = repl_state.replicas.lock().await;
+    if let Some(replica_list) = replicas.as_mut() {
+        replica_list.push(client.clone());
+    }
 }
 
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
@@ -1123,8 +1155,48 @@ pub struct Command {
 }
 
 impl Command {
+    pub fn from(resp_str: &[u8]) -> Option<Self> {
+        let unparsed_str = std::str::from_utf8(resp_str).unwrap();
+        let mut lines = unparsed_str.split("\r\n");
+
+        lines.next(); // Skip array header
+
+        let mut parsed = Vec::new();
+        while let Some(curr_line) = lines.next() {
+            // Skip non-bulk-string-length lines
+            if !curr_line.starts_with('$') { continue; }
+            // Get length and add next line to parsed Vec
+            let len = curr_line[1..].parse().unwrap();
+            if let Some(val) = lines.next() {
+                parsed.push(val[..len].to_string());
+            }
+        }
+
+        let args = match parsed.len() {
+            0 => { return None; } // Empty command
+            1 => None,
+            _ => Some(Vec::from(parsed[1..].to_vec()))
+        };
+
+        Some(Self {
+            name: parsed[0].clone(),
+            args
+        })
+    }
+
     pub async fn execute(&mut self, client: &Client, config: Config, repl_state: ReplState,
                          db: Database, blocked_clients: BlockedClients) {
+        if config.is_master && self.is_write() {
+            // Propagate command to replicas
+            let replicas = repl_state.replicas.lock().await;
+            if let Some(replica_list) = replicas.as_ref() {
+                let cmd = self.to_resp_array();
+                for replica in replica_list {
+                    replica.tx.send(cmd.clone()).unwrap();
+                }
+            }
+        }
+        
         let uc_name = self.name.to_uppercase();
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
 
@@ -1162,8 +1234,37 @@ impl Command {
             "DISCARD"  => cmd_discard(&client).await,
             "INFO"     => cmd_info(args, &client, config, repl_state, ).await,
             "REPLCONF" => cmd_replconf(args, &client, config, repl_state),
-            "PSYNC"    => cmd_psync(&client, repl_state),
+            "PSYNC"    => cmd_psync(&client, repl_state).await,
             _          => cmd_other(&self.name, args, &client)
         }
+    }
+
+    fn is_write(&self) -> bool {
+        matches!(
+            self.name.to_uppercase().as_str(),
+            "SET" | "INCR" | // Keyspace
+            "RPUSH" | "LPUSH" | "RPOP" | "LPOP" | // Lists
+            "XADD" | // Streams
+            "MULTI" | "EXEC" | "DISCARD" // Transactions
+        )
+    }
+
+    fn to_resp_array(&self) -> Vec<u8> {
+        let mut res: Vec<u8> = Vec::from(format!(
+            "*{}\r\n${}\r\n{}\r\n",
+            1 + self.args.as_ref().unwrap_or(&Vec::new()).len(),
+            self.name.len(),
+            self.name
+        ).into_bytes());
+        
+        if let Some(args) = self.args.as_ref() {
+            for arg in args {
+                res.extend(format!(
+                    "${}\r\n{arg}\r\n", arg.len()
+                ).into_bytes());
+            }
+        }
+
+        res
     }
 }
