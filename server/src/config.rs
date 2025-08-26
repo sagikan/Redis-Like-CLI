@@ -8,9 +8,9 @@ static DEF_PORT: u16 = 6379;
 
 pub type Config = Arc<Config_>;
 
-pub type ReplState = Arc<ReplState_>;
+pub type ReplState = Arc<Mutex<ReplState_>>;
 
-pub type Replicas = Arc<Mutex<Option<Vec<Client>>>>;
+pub type Replicas = Arc<Option<Vec<Client>>>;
 
 fn gen_rand_str() -> String {
     // Generate a pseudo-random alphanumeric string of 40 characters
@@ -72,16 +72,17 @@ impl Config_ {
         config
     }
 
-    pub fn get_replication(&self, repl_state: ReplState) -> Vec<u8> {
+    pub async fn get_replication(&self, repl_state: ReplState) -> Vec<u8> {
         let role = if self.is_master { "master" } else { "slave" };
-        let master_replid = &repl_state.replid;
-        let master_repl_offset = &repl_state.repl_offset;
+        let repl_state_guard = repl_state.lock().await;
+        let master_replid = &repl_state_guard.replid;
+        let master_repl_offset = &repl_state_guard.repl_offset;
 
         let content = format!("\
             # Replication\r\n\
             role:{role}\r\n\
             master_replid:{master_replid}\r\n\
-            master_repl_offset:{master_repl_offset}\r\n"
+            master_repl_offset:{master_repl_offset}"
         );
         
         format!("${}\r\n{content}\r\n", content.len()).into_bytes()
@@ -100,7 +101,7 @@ impl Default for ReplState_ {
         Self {
             replid: gen_rand_str(),
             repl_offset: 0,
-            replicas: Replicas::default()
+            replicas: Replicas::default() // None
         }
     }
 }

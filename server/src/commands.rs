@@ -11,10 +11,10 @@ use crate::db::*;
 use crate::config::{Config, ReplState};
 use crate::client::{Client, BlockedClient, Response};
 
-fn set_pair(key: String, value: Value, client: &Client,
+fn set_pair(key: String, value: Value, client: &Client, to_send: bool,
             mut guard: MutexGuard<'_, HashMap<String, Value>>) {
     guard.insert(key, value);
-    client.tx.send(Response::Ok.into()).unwrap();
+    client.send_if(to_send, Response::Ok);
 }
 
 async fn validate_added_entry_id(
@@ -168,14 +168,14 @@ fn cmd_echo(args: Vec<String>, client: &Client) {
     }
 }
 
-async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_set(to_send: bool, args: Vec<String>, client: &Client, db: Database) {
     let guard = db.lock().await;
 
     match args.len() {
         2 => { // [Key] [Value]
             let key = args[0].clone();
             let value = Value { val: ValueType::String(args[1].clone()) };
-            set_pair(key, value, &client, guard);
+            set_pair(key, value, &client, to_send, guard);
         }, 3 => { // [Key] [Value] [NX / XX]
             let key = args[0].clone();
             let value = Value { val: ValueType::String(args[1].clone()) };
@@ -183,9 +183,9 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
             match (
                 args[2].to_uppercase().as_str(), guard.contains_key(&key)
             ) {
-                ("NX", false) | ("XX", true) => set_pair(key, value, &client, guard),
-                ("NX", true) | ("XX", false) => client.tx.send(Response::Nil.into()).unwrap(),
-                _ => client.tx.send(Response::ErrSyntax.into()).unwrap()
+                ("NX", false) | ("XX", true) => set_pair(key, value, &client, to_send, guard),
+                ("NX", true) | ("XX", false) => client.send_if(to_send, Response::Nil),
+                _ => client.send_if(to_send, Response::ErrSyntax)
             }
         }, 4 => { // [Key] [Value] [EX / PX] [Stringified Number]
             match args[2].to_uppercase().as_str() {
@@ -194,7 +194,7 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
                     let timeout = match args[3].parse::<u64>() {
                         Ok(t) if t > 0 => if arg == "EX" { t * 1000 } else { t },
                         _ => {
-                            client.tx.send(Response::ErrSetExpireTime.into()).unwrap();
+                            client.send_if(to_send, Response::ErrSetExpireTime);
                             return;
                         }
                     };
@@ -203,15 +203,15 @@ async fn cmd_set(args: Vec<String>, client: &Client, db: Database) {
                     let value = Value { val: ValueType::String(args[1].clone()) };
 
                     // Insert + employ active expiration via Tokio-runtime
-                    set_pair(key.clone(), value, &client, guard);
+                    set_pair(key.clone(), value, &client, to_send, guard);
                     let tokio_db = db.clone();
                     tokio::spawn(async move {
                         sleep(Duration::from_millis(timeout as u64)).await;
                         tokio_db.lock().await.remove(&key);
                     });
-                }, _ => client.tx.send(Response::ErrSyntax.into()).unwrap()
+                }, _ => client.send_if(to_send, Response::ErrSyntax)
             }
-        }, _ => client.tx.send(Response::ErrArgCount.into()).unwrap()
+        }, _ => client.send_if(to_send, Response::ErrArgCount)
     }
 }
 
@@ -235,10 +235,10 @@ async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val}\r\n").into_bytes()).unwrap();
 }
 
-async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
-                  db: Database, blocked_clients: BlockedClients) {
+async fn cmd_push(from_right: bool, to_send: bool, args: Vec<String>,
+                  client: &Client, db: Database, blocked_clients: BlockedClients) {
     if args.len() < 2 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -273,9 +273,9 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
                 };
 
                 // Emit key + popped value
-                front_client.client.tx.send(format!(
+                front_client.client.send_if(to_send, format!(
                     "*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
-                ).into_bytes()).unwrap();
+                ).into_bytes());
                 
                 to_unblock.push(front_client);
             }
@@ -310,7 +310,7 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
 
                 stored_val_list.len()
             }, _ => { // Value is of the wrong type
-                client.tx.send(Response::WrongType.into()).unwrap();
+                client.send_if(to_send, Response::WrongType);
                 return;
             }
         }, None => {
@@ -325,14 +325,14 @@ async fn cmd_push(from_right: bool, args: Vec<String>, client: &Client,
     };
     
     // Emit the list's length
-    client.tx.send(format!(":{stored_val_list_len}\r\n").into_bytes()).unwrap();
+    client.send_if(to_send, format!(":{stored_val_list_len}\r\n").into_bytes());
 }
 
-async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
-                 db: Database) {
+async fn cmd_pop(from_right: bool, to_send: bool, args: Vec<String>,
+                 client: &Client, db: Database) {
     let args_len = args.len();
     if args_len != 1 && args_len != 2 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -343,7 +343,7 @@ async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
         2 => match args[1].parse::<u64>() {
             Ok(v) => v,
             _ => {
-                client.tx.send(Response::ErrOutOfRange.into()).unwrap();
+                client.send_if(to_send, Response::ErrOutOfRange);
                 return;
             }
         }, _ => 0
@@ -373,23 +373,23 @@ async fn cmd_pop(from_right: bool, args: Vec<String>, client: &Client,
                     ) 
                 };
 
-                client.tx.send(bulk_str.into_bytes()).unwrap();
+                client.send_if(to_send, bulk_str.into_bytes());
 
                 // Remove key if popped all values
                 if pop_num_usize == val_list_len {
                     guard.remove(key);
                 }
             }, // Value is of the wrong type
-            _ => client.tx.send(Response::WrongType.into()).unwrap()
-        }, None => client.tx.send(Response::Nil.into()).unwrap()
+            _ => client.send_if(to_send, Response::WrongType)
+        }, None => client.send_if(to_send, Response::Nil)
     }    
 }
 
-async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
-                  db: Database, blocked_clients: BlockedClients) {
+async fn cmd_bpop(from_right: bool, to_send: bool, args: Vec<String>,
+                  client: &Client, db: Database, blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 2 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -406,16 +406,16 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
                         true => val_list.pop_back().unwrap(),
                         false => val_list.pop_front().unwrap()
                     }, _ => { // Value is of the wrong type
-                        client.tx.send(Response::WrongType.into()).unwrap();
+                        client.send_if(to_send, Response::WrongType);
                         return;
                     }
                 }, None => { continue; } // Skip
             };
 
             // Emit key + popped value array
-            client.tx.send(format!(
+            client.send_if(to_send, format!(
                 "*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
-            ).into_bytes()).unwrap();
+            ).into_bytes());
             return;
         }
     }
@@ -441,7 +441,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
     let block = match args[args_len-1].parse::<f64>() {
         Ok(v) if v >= 0.0 => v,
         _ => {
-            client.tx.send(Response::ErrNegativeTimeout.into()).unwrap();
+            client.send_if(to_send, Response::ErrNegativeTimeout);
             return;
         }
     };
@@ -468,7 +468,7 @@ async fn cmd_bpop(from_right: bool, args: Vec<String>, client: &Client,
             }
 
             if still_blocked {
-                tokio_client.tx.send(Response::Nil.into()).unwrap();
+                tokio_client.send_if(to_send, Response::Nil);
             }
         });
     }
@@ -564,11 +564,11 @@ async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val_type}\r\n").into_bytes()).unwrap();
 }
 
-async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
+async fn cmd_xadd(to_send: bool, args: Vec<String>, client: &Client, db: Database,
                   blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 4 || args_len % 2 == 1 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -608,7 +608,7 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                 // An existing stream is found
                 ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
                 // Value is of the wrong type
-                _ => client.tx.send(Response::WrongType.into()).unwrap()
+                _ => client.send_if(to_send, Response::WrongType)
             }, None => {
                 let entries = Entries::default();
                 // Insert entry + create stream
@@ -675,7 +675,7 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
                     }
                 }
                 bulk_str = format!("*{with_following_entries}\r\n{bulk_str}");
-                blocked_client.client.tx.send(bulk_str.into_bytes()).unwrap();
+                blocked_client.client.send_if(to_send, bulk_str.into_bytes());
 
                 to_unblock.push(blocked_client.clone());
             }
@@ -695,9 +695,9 @@ async fn cmd_xadd(args: Vec<String>, client: &Client, db: Database,
 
     // Emit the entry ID
     let entry_id = format!("{ms_time}-{seq_num}");
-    client.tx.send(format!(
+    client.send_if(to_send, format!(
         "${}\r\n{entry_id}\r\n", entry_id.len()
-    ).into_bytes()).unwrap();
+    ).into_bytes());
 }
 
 async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
@@ -999,9 +999,9 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
     }
 }
 
-async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_incr(to_send: bool, args: Vec<String>, client: &Client, db: Database) {
     if args.len() != 1 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -1018,11 +1018,11 @@ async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
                     
                     res
                 }, _ => {
-                    client.tx.send(Response::ErrNotInteger.into()).unwrap();
+                   client.send_if(to_send, Response::ErrNotInteger);
                     return;
                 }
             }, _ => { // Value is of the wrong type
-                client.tx.send(Response::WrongType.into()).unwrap();
+                client.send_if(to_send, Response::WrongType);
                 return;
             }
         }, None => { // Key doesn't exist
@@ -1036,26 +1036,26 @@ async fn cmd_incr(args: Vec<String>, client: &Client, db: Database) {
     };
 
     // Emit new value
-    client.tx.send(format!(":{incr_val}\r\n").into_bytes()).unwrap();
+    client.send_if(to_send, format!(":{incr_val}\r\n").into_bytes());
 }
 
-async fn cmd_multi(client: &Client) {
+async fn cmd_multi(to_send: bool, client: &Client) {
     let mut in_transaction = client.in_transaction.lock().await;
     if *in_transaction {
-        client.tx.send(Response::ErrNestedMulti.into()).unwrap();
+        client.send_if(to_send, Response::ErrNestedMulti);
         return;
     }
     *in_transaction = true; // Start transaction
 
-    client.tx.send(Response::Ok.into()).unwrap();
+    client.send_if(to_send, Response::Ok);
 }
 
-async fn cmd_exec(client: &Client, config: Config, repl_state: ReplState,
-                  db: Database, blocked_clients: BlockedClients) {
+async fn cmd_exec(to_send: bool, client: &Client, config: Config,
+                  repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
     {
         let mut in_transaction = client.in_transaction.lock().await;
         if !*in_transaction {
-            client.tx.send(Response::ErrExecWithoutMulti.into()).unwrap();
+            client.send_if(to_send, Response::ErrExecWithoutMulti);
             return;
         }
         *in_transaction = false; // End transaction
@@ -1063,21 +1063,21 @@ async fn cmd_exec(client: &Client, config: Config, repl_state: ReplState,
 
     let queue: Vec<Command> = client.queued_commands.lock().await.drain(..).collect();
     // Emit array length
-    client.tx.send(format!("*{}\r\n", queue.len()).into_bytes()).unwrap();
+    client.send_if(to_send, format!("*{}\r\n", queue.len()).into_bytes());
     // Execute queued commands
     for mut cmd in queue {
         // Box::pin for recursion warning
         Box::pin(cmd.execute(
-                &client, config.clone(), repl_state.clone(), db.clone(), blocked_clients.clone()
+            &client, config.clone(), repl_state.clone(), db.clone(), blocked_clients.clone()
         )).await;
     }
 }
 
-async fn cmd_discard(client: &Client) {
+async fn cmd_discard(to_send: bool, client: &Client) {
     {
         let mut in_transaction = client.in_transaction.lock().await;
         if !*in_transaction {
-            client.tx.send(Response::ErrDiscardWithoutMulti.into()).unwrap();
+            client.send_if(to_send, Response::ErrDiscardWithoutMulti);
             return;
         }
         *in_transaction = false; // End transaction
@@ -1086,7 +1086,7 @@ async fn cmd_discard(client: &Client) {
     // Empty command queue
     client.queued_commands.lock().await.clear();
 
-    client.tx.send(Response::Ok.into()).unwrap();
+    client.send_if(to_send, Response::Ok);
 }
 
 async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state: ReplState) {
@@ -1094,7 +1094,7 @@ async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state
         0 => { todo!(); }, // Default
         1 => { // [Section]
             match args[0].to_uppercase().as_str() {
-                "REPLICATION" => config.get_replication(repl_state),
+                "REPLICATION" => config.get_replication(repl_state).await,
                 _ => todo!()
             }
         }, _ => Response::WrongType.into()
@@ -1110,15 +1110,18 @@ fn cmd_replconf(_args: Vec<String>, client: &Client, _config: Config, _repl_stat
 }
 
 async fn cmd_psync(client: &Client, repl_state: ReplState) {
-    client.tx.send(format!(
-        "+FULLRESYNC {} {}\r\n", repl_state.replid, repl_state.repl_offset
-    ).into_bytes()).unwrap();
+    {
+        let repl_state_guard = repl_state.lock().await;
+        client.tx.send(format!(
+            "+FULLRESYNC {} {}\r\n", repl_state_guard.replid, repl_state_guard.repl_offset
+        ).into_bytes()).unwrap();
+    }
 
     // Decode an empty RDB to binary
     let empty_rdb = match hex_to_binary(Response::EmptyRDB.into()) {
         Ok(bin_content) => bin_content,
         _ => { 
-            eprintln!("Couldn't resync replica");
+            eprintln!("Resync failed");
             return;
         }
     };
@@ -1131,9 +1134,11 @@ async fn cmd_psync(client: &Client, repl_state: ReplState) {
     client.tx.send(bulk_str).unwrap();
 
     // Store replica's sender
-    let mut replicas = repl_state.replicas.lock().await;
-    if let Some(replica_list) = replicas.as_mut() {
-        replica_list.push(client.clone());
+    let mut repl_state_guard = repl_state.lock().await;
+    if let Some(replicas_arc) = Arc::get_mut(&mut repl_state_guard.replicas) {
+        if let Some(replica_list) = replicas_arc.as_mut() {
+            replica_list.push(client.clone());
+        }
     }
 }
 
@@ -1151,14 +1156,14 @@ fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
 #[derive(Clone)]
 pub struct Command {
     pub name: String,
-    pub args: Option<Vec<String>>
+    pub args: Option<Vec<String>>,
+    pub is_propagated: bool
 }
 
 impl Command {
-    pub fn from(resp_str: &[u8]) -> Option<Self> {
-        let unparsed_str = std::str::from_utf8(resp_str).unwrap();
+    pub fn from(resp_str: &[u8], is_propagated: bool) -> Option<Self> {
+        let unparsed_str = str::from_utf8(resp_str).unwrap();
         let mut lines = unparsed_str.split("\r\n");
-
         lines.next(); // Skip array header
 
         let mut parsed = Vec::new();
@@ -1180,26 +1185,34 @@ impl Command {
 
         Some(Self {
             name: parsed[0].clone(),
-            args
+            args,
+            is_propagated
         })
     }
 
-    pub async fn execute(&mut self, client: &Client, config: Config, repl_state: ReplState,
-                         db: Database, blocked_clients: BlockedClients) {
-        if config.is_master && self.is_write() {
-            // Propagate command to replicas
-            let replicas = repl_state.replicas.lock().await;
-            if let Some(replica_list) = replicas.as_ref() {
-                let cmd = self.to_resp_array();
-                for replica in replica_list {
-                    replica.tx.send(cmd.clone()).unwrap();
+    pub async fn execute(
+        &mut self, client: &Client, config: Config, repl_state: ReplState,
+        db: Database, blocked_clients: BlockedClients
+    ) {
+        let mut to_send = true;
+        if self.is_write() { // Handle propagation
+            if config.is_master {
+                // Propagate command to replicas
+                if let Some(replica_list) = repl_state.lock().await.replicas.as_ref() {
+                    let cmd = self.to_resp_array();
+                    for replica in replica_list {
+                        replica.tx.send(cmd.clone()).unwrap();
+                    }
                 }
+            } else if self.is_propagated {
+                // Set executable to not reply
+                to_send = false;
             }
         }
         
         let uc_name = self.name.to_uppercase();
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
-
+        
         // Queue non-EXEC/DISCARD command if in transaction mode
         if *client.in_transaction.lock().await
            && !transactional_cmds.contains(&uc_name.as_str()) {
@@ -1214,25 +1227,25 @@ impl Command {
         match uc_name.as_str() {
             "PING"     => client.tx.send(Response::Pong.into()).unwrap(),
             "ECHO"     => cmd_echo(args, &client),
-            "SET"      => cmd_set(args, &client, db).await,
+            "SET"      => cmd_set(to_send, args, &client, db).await,
             "GET"      => cmd_get(args, &client, db).await,
-            "RPUSH"    => cmd_push(true, args, &client, db, blocked_clients).await,
-            "LPUSH"    => cmd_push(false, args, &client, db, blocked_clients).await,
-            "RPOP"     => cmd_pop(true, args, &client, db).await,
-            "LPOP"     => cmd_pop(false, args, &client, db).await,
-            "BRPOP"    => cmd_bpop(true, args, &client, db, blocked_clients).await,
-            "BLPOP"    => cmd_bpop(false, args, &client, db, blocked_clients).await,
+            "RPUSH"    => cmd_push(true, to_send, args, &client, db, blocked_clients).await,
+            "LPUSH"    => cmd_push(false, to_send, args, &client, db, blocked_clients).await,
+            "RPOP"     => cmd_pop(true, to_send, args, &client, db).await,
+            "LPOP"     => cmd_pop(false, to_send, args, &client, db).await,
+            "BRPOP"    => cmd_bpop(true, to_send, args, &client, db, blocked_clients).await,
+            "BLPOP"    => cmd_bpop(false, to_send, args, &client, db, blocked_clients).await,
             "LRANGE"   => cmd_lrange(args, &client, db).await,
             "LLEN"     => cmd_llen(args, &client, db).await,
             "TYPE"     => cmd_type(args, &client, db).await,
-            "XADD"     => cmd_xadd(args, &client, db, blocked_clients).await,
+            "XADD"     => cmd_xadd(to_send, args, &client, db, blocked_clients).await,
             "XRANGE"   => cmd_xrange(args, &client, db).await,
             "XREAD"    => cmd_xread(args, &client, db, blocked_clients).await,
-            "INCR"     => cmd_incr(args, &client, db).await,
-            "MULTI"    => cmd_multi(&client).await,
-            "EXEC"     => cmd_exec(&client, config, repl_state, db, blocked_clients).await,
-            "DISCARD"  => cmd_discard(&client).await,
-            "INFO"     => cmd_info(args, &client, config, repl_state, ).await,
+            "INCR"     => cmd_incr(to_send, args, &client, db).await,
+            "MULTI"    => cmd_multi(to_send, &client).await,
+            "EXEC"     => cmd_exec(to_send, &client, config, repl_state, db, blocked_clients).await,
+            "DISCARD"  => cmd_discard(to_send, &client).await,
+            "INFO"     => cmd_info(args, &client, config, repl_state).await,
             "REPLCONF" => cmd_replconf(args, &client, config, repl_state),
             "PSYNC"    => cmd_psync(&client, repl_state).await,
             _          => cmd_other(&self.name, args, &client)

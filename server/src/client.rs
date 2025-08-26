@@ -16,6 +16,14 @@ pub struct Client {
     pub queued_commands: Arc<Mutex<Vec<Command>>>
 }
 
+impl Client {
+    pub fn send_if(&self, to_send: bool, msg: impl Into<Vec<u8>>) {
+        if to_send {
+            self.tx.send(msg.into()).unwrap();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BlockedClient {
     pub client: Client,

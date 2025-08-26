@@ -4,37 +4,102 @@ mod client;
 mod commands;
 
 use std::env;
+use std::str;
 use std::error::Error;
 use std::sync::Arc;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use tokio::sync::{mpsc::unbounded_channel, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use crate::db::*;
 use crate::config::*;
 use crate::client::{get_next_id, Client, Response};
 use crate::commands::Command;
 
-fn send_and_verify(
+static SML_BUFSIZE: usize = 16;
+static MID_BUFSIZE: usize = 256;
+static BIG_BUFSIZE: usize = 1024;
+
+fn process_rdb(rdb: &[u8]) {
+    let n = rdb.len();
+    if let Some(start) = rdb[..n].iter().position(|&c| c == b'$') {
+        if let Some(end) = rdb[start+1..n].windows(2).position(|w| w == b"\r\n") {
+            // Extract length of RDB file
+            let _rdb_len: usize = str::from_utf8(
+                &rdb[start+1..start+1+end]
+            ).unwrap().parse().unwrap();
+
+            // (Skip processing file for now)
+        }
+    }
+}
+
+async fn send_and_verify(
     stream: &mut TcpStream, to_write: Vec<u8>, expected: Vec<u8>, error: &str
-)-> Result<(), Box<dyn Error>> {
-    let mut buf = [0; 256];
+) -> Result<(), Box<dyn Error>> {
+    let mut buf = [0; SML_BUFSIZE];
 
     // Write/read to/from stream + verify reponse
-    stream.write_all(&to_write)?;
-    let bytes_read = stream.read(&mut buf)?;
-    if buf[..bytes_read] != expected[..] && !buf[..bytes_read].starts_with(&expected) {
+    stream.write_all(&to_write).await?;
+    let bytes_read = stream.read(&mut buf).await?;
+    if buf[..bytes_read] != expected[..] {
         return Err(error.into());
     }
 
     Ok(())
 }
 
-fn send_handshake(
-    master_addr: &String, master_port: u16, port: u16
-) -> Result<(), Box<dyn Error>> {
-    let mut stream = TcpStream::connect(format!("{master_addr}:{master_port}"))?;
+async fn send_and_process_psync(
+    stream: &mut TcpStream, repl_state: ReplState
+) -> Result<bool, Box<dyn Error>> {
+    let mut buf = [0; MID_BUFSIZE];
+
+    // Write/read to/from stream + verify reponse
+    stream.write_all(format!(
+        "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+    ).as_bytes()).await?;
+    let bytes_read = stream.read(&mut buf).await?;
+    if !buf[..bytes_read].starts_with("+FULLRESYNC".to_string().as_bytes()) {
+        return Err("'PSYNC' -> Master".into());
+    }
+
+    // Process FULLRESYNC
+    let resync_end = match &buf[..bytes_read].windows(2).position(
+        |w| w == b"\r\n"
+    ) {
+        Some(pos) => pos.clone(),
+        None => { return Err("Resync failed".into()); }
+    };
+    let split: Vec<&str> = str::from_utf8(&buf[..resync_end])?
+        .trim() // Remove \r\n
+        .split(' ').collect();
+    let (master_replid, master_repl_offset) = match (split.get(1), split.get(2)) {
+        (Some(id), Some(offset)) => (id.to_string(), offset.parse::<u64>()?),
+        _ => { return Err("Resync failed".into()); }
+    };
+
+    {
+        let mut repl_state_guard = repl_state.lock().await;
+        repl_state_guard.replid = master_replid.to_string();
+        repl_state_guard.repl_offset = master_repl_offset;
+    }
+    
+    // Process resync RDB file (optional)
+    let rdb_start = resync_end + 2;
+    let read_rdb = if rdb_start != bytes_read {
+        process_rdb(&buf[rdb_start..bytes_read]);
+
+        true
+    } else {
+        false
+    };
+
+    Ok(read_rdb)
+}
+
+async fn send_handshake(
+    master_addr: &String, master_port: u16, port: u16, repl_state: ReplState
+) -> Result<(TcpStream, bool), Box<dyn Error>> {
+    let mut stream = TcpStream::connect(format!("{master_addr}:{master_port}")).await?;
 
     // (1) PING
     send_and_verify(
@@ -42,7 +107,8 @@ fn send_handshake(
         Response::Ping.into(),
         Response::Pong.into(),
         "'PING' -> Master"
-    )?;
+    ).await?;
+
     // (2) REPLCONF listening-port <PORT>
     send_and_verify(
         &mut stream,
@@ -51,7 +117,8 @@ fn send_handshake(
         ).into_bytes(),
         Response::Ok.into(),
         "'REPLCONF listening-port' -> Master"
-    )?;
+    ).await?;
+
     // (3) REPLCONF capa psync2
     send_and_verify(
         &mut stream,
@@ -60,23 +127,19 @@ fn send_handshake(
         ).into_bytes(),
         Response::Ok.into(),
         "'REPLCONF capa' -> Master"
-    )?;
+    ).await?;
+
     // (4) PSYNC ? -1
-    send_and_verify(
-        &mut stream,
-        format!(
-            "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
-        ).into_bytes(),
-        "+FULLRESYNC".to_string().into_bytes(),
-        "'PSYNC' -> Master"
-    )?;
-    
-    Ok(())
+    let read_rdb = send_and_process_psync(&mut stream, repl_state).await?;
+
+    Ok((stream, read_rdb))
 }
 
-async fn process_cmd(cmd: &[u8], client: &Client, config: Config, repl_state: ReplState,
-                     db: Database, blocked_clients: BlockedClients) {
-    let mut cmd: Command = match Command::from(cmd) {
+async fn process_cmd(
+    cmd: &[u8], is_propagated: bool, client: &Client, config: Config,
+    repl_state: ReplState, db: Database, blocked_clients: BlockedClients
+) {
+    let mut cmd: Command = match Command::from(cmd, is_propagated) {
         Some(cmd) => cmd,
         None => { // Empty command
             client.tx.send(Response::ErrEmptyCommand.into()).unwrap();
@@ -87,36 +150,8 @@ async fn process_cmd(cmd: &[u8], client: &Client, config: Config, repl_state: Re
     cmd.execute(&client, config, repl_state, db, blocked_clients).await; 
 }
 
-#[tokio::main]
-async fn main() {
-    // Set server configuration + DBs
-    let config = Arc::new(Config_::from(env::args().skip(1).collect()));
-    let repl_state = ReplState::default();
-    let db = Database::default();
-    let blocked_clients = BlockedClients::default();
-
-    if config.is_master {
-        // Set a Replicas object in ReplState
-        let mut replicas = repl_state.replicas.lock().await;
-        *replicas = Some(Vec::new());
-    } else { // Replica
-        // Initiate handshake with master
-        if let Err(e) = send_handshake(
-            config.master_addr.as_ref().unwrap(),
-            config.master_port.unwrap(),
-            config.port
-        ) {
-            eprintln!("Error: {}", e);
-            return;
-        }
-    }
-
-    // Set listener
-    let listener = TcpListener::bind(format!(
-        "{}:{}", config.bind_addr, config.port
-    )).await.unwrap();
-
-    // Event loop
+async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState,
+                    db: Database, blocked_clients: BlockedClients) {
     loop {
         // Accept client
         let (socket, _) = listener.accept().await.unwrap();
@@ -143,25 +178,139 @@ async fn main() {
         let tokio_db = db.clone();
         let tokio_blocked_clients = blocked_clients.clone();
         tokio::spawn(async move {
-            let mut buf = vec![0; 1024];
+            let mut buf = vec![0; BIG_BUFSIZE];
 
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => return, // Connection closed
                     Ok(n) => process_cmd(
-                        &buf[0..n],
+                        &buf[..n],
+                        false,
                         &client,
                         tokio_config.clone(),
                         tokio_repl_state.clone(),
                         tokio_db.clone(),
                         tokio_blocked_clients.clone()
-                    ).await,
-                    Err(e) => {
-                        eprintln!("Error: {}", e);
+                    ).await, Err(e) => {
+                        eprintln!("Error: {e}");
                         return;
                     }
                 }
             }
         });
     }
+}
+
+fn run_replica(master_stream: TcpStream, read_rdb: bool, config: Config,
+               repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
+    let (mut reader, _) = master_stream.into_split();
+    let (tx, _) = unbounded_channel::<Vec<u8>>();
+    let client = Client {
+        id: 0, // Dummy
+        tx,
+        in_transaction: Arc::new(Mutex::new(false)),
+        queued_commands: Arc::new(Mutex::new(Vec::new()))
+    };
+
+    // Tokio-runtime read task
+    tokio::spawn(async move {
+        let mut buf = vec![0; BIG_BUFSIZE];
+
+        if !read_rdb {
+            // Process resync RDB file
+            match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => process_rdb(&buf[..n]),
+                _ => {
+                    eprintln!("Resync failed");
+                    return;
+                }
+            }
+        }
+
+        loop {
+            // Process propagated commands
+            match reader.read(&mut buf).await {
+                Ok(0) => return, // Connection closed
+                Ok(n) => {
+                    // (Might arrive in blocks)
+                    let mut cmd_start = 0;
+                    while cmd_start < n {
+                        let cmd_end = buf[cmd_start+1..n].windows(3).position(
+                            |w| w == b"\r\n*"
+                        ).unwrap_or(n - 2) + 2;
+                        let cmd = &buf[cmd_start..cmd_start+cmd_end];
+                        
+                        process_cmd(
+                            cmd,
+                            true,
+                            &client,
+                            config.clone(),
+                            repl_state.clone(),
+                            db.clone(),
+                            blocked_clients.clone()
+                        ).await;
+
+                        cmd_start = cmd_end;
+                    }
+                }, Err(e) => {
+                    eprintln!("Error: {e}");
+                    return;
+                }
+            }
+        }
+    });
+}
+
+#[tokio::main]
+async fn main() {
+    // Set server configuration + DBs
+    let config = Arc::new(Config_::from(env::args().skip(1).collect()));
+    let repl_state = if config.is_master {
+        let repl_state = ReplState::default();
+        {
+            let mut state = repl_state.lock().await;
+            state.replicas = Arc::new(Some(Vec::new()));
+        }
+
+        repl_state
+    } else {
+        ReplState::default() // Updated during handshake
+    };
+    let db = Database::default();
+    let blocked_clients = BlockedClients::default();
+
+    // Set listener
+    let listener = TcpListener::bind(format!(
+        "{}:{}", config.bind_addr, config.port
+    )).await.unwrap();
+
+    // Run server-side
+    let tokio_config = config.clone();
+    let tokio_repl_state = repl_state.clone();
+    let tokio_db = db.clone();
+    let tokio_blocked_clients = blocked_clients.clone();
+    let server_handler = tokio::spawn(async move {
+        run_server(
+            listener, tokio_config, tokio_repl_state, tokio_db, tokio_blocked_clients
+        ).await;
+    });
+
+    // Run replica-side
+    if !config.is_master {
+        // Initiate handshake with master
+        match send_handshake(
+            config.master_addr.as_ref().unwrap(),
+            config.master_port.unwrap(),
+            config.port,
+            repl_state.clone()
+        ).await {
+            Ok((stream, read_rdb)) => run_replica(
+                stream, read_rdb, config, repl_state, db, blocked_clients
+            ), Err(e) => {
+                eprintln!("Error: {e}");
+            }
+        }
+    }
+
+    server_handler.await.unwrap(); // Keep-Alive
 }
