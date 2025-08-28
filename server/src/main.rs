@@ -15,27 +15,12 @@ use crate::config::*;
 use crate::client::{get_next_id, Client, Response};
 use crate::commands::Command;
 
-static SML_BUFSIZE: usize = 16;
-static MID_BUFSIZE: usize = 256;
+static SML_BUFSIZE: usize = 256;
 static BIG_BUFSIZE: usize = 1024;
-
-fn process_rdb(rdb: &[u8]) {
-    let n = rdb.len();
-    if let Some(start) = rdb[..n].iter().position(|&c| c == b'$') {
-        if let Some(end) = rdb[start+1..n].windows(2).position(|w| w == b"\r\n") {
-            // Extract length of RDB file
-            let _rdb_len: usize = str::from_utf8(
-                &rdb[start+1..start+1+end]
-            ).unwrap().parse().unwrap();
-
-            // (Skip processing file for now)
-        }
-    }
-}
 
 async fn send_and_verify(
     stream: &mut TcpStream, to_write: Vec<u8>, expected: Vec<u8>, error: &str
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; SML_BUFSIZE];
 
     // Write/read to/from stream + verify reponse
@@ -50,56 +35,68 @@ async fn send_and_verify(
 
 async fn send_and_process_psync(
     stream: &mut TcpStream, repl_state: ReplState
-) -> Result<bool, Box<dyn Error>> {
-    let mut buf = [0; MID_BUFSIZE];
+) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
+    let mut buf = vec![0; BIG_BUFSIZE]; // Growable buffer
 
     // Write/read to/from stream + verify reponse
-    stream.write_all(format!(
-        "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
-    ).as_bytes()).await?;
-    let bytes_read = stream.read(&mut buf).await?;
-    if !buf[..bytes_read].starts_with("+FULLRESYNC".to_string().as_bytes()) {
+    stream.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n").await?;
+    let mut n = stream.read(&mut buf).await?;
+    if !buf[..n].starts_with(b"+FULLRESYNC") {
         return Err("'PSYNC' -> Master".into());
     }
 
     // Process FULLRESYNC
-    let resync_end = match &buf[..bytes_read].windows(2).position(
-        |w| w == b"\r\n"
-    ) {
-        Some(pos) => pos.clone(),
+    let resync_end = match buf[..n].windows(2).position(|w| w == b"\r\n") {
+        Some(pos) => pos,
         None => { return Err("Resync failed".into()); }
     };
     let split: Vec<&str> = str::from_utf8(&buf[..resync_end])?
         .trim() // Remove \r\n
-        .split(' ').collect();
+        .split(' ')
+        .collect();
     let (master_replid, master_repl_offset) = match (split.get(1), split.get(2)) {
         (Some(id), Some(offset)) => (id.to_string(), offset.parse::<u64>()?),
         _ => { return Err("Resync failed".into()); }
     };
 
-    {
-        let mut repl_state_guard = repl_state.lock().await;
-        repl_state_guard.replid = master_replid.to_string();
-        repl_state_guard.repl_offset = master_repl_offset;
+    { // Update replica's ReplState
+        let mut state_guard = repl_state.lock().await;
+        state_guard.replid = master_replid.to_string();
+        state_guard.repl_offset = master_repl_offset;
     }
     
-    // Process resync RDB file (optional)
+    // Process RDB file
     let rdb_start = resync_end + 2;
-    let read_rdb = if rdb_start != bytes_read {
-        process_rdb(&buf[rdb_start..bytes_read]);
-
-        true
-    } else {
-        false
+    let rdb_end = loop { // Try
+        match process_rdb(&buf[rdb_start..n]) {
+            Ok(rel_end) => break rdb_start + rel_end, // Absolute end value
+            _ => { // Read more data
+                buf.resize(n + BIG_BUFSIZE, 0);
+                match stream.read(&mut buf[n..]).await {
+                    Ok(0) => return Err("Resync failed".into()),
+                    Ok(m) => n += m, // Will now process more data
+                    Err(e) => return Err(Box::new(e))
+                }
+            }
+        }
     };
 
-    Ok(read_rdb)
+    // Return attached data (if exists)
+    let attached = if rdb_end < n {
+        Some(buf[rdb_end..n].to_vec())
+    } else {
+        None
+    };
+
+    Ok(attached)
 }
 
 async fn send_handshake(
     master_addr: &String, master_port: u16, port: u16, repl_state: ReplState
-) -> Result<(TcpStream, bool), Box<dyn Error>> {
-    let mut stream = TcpStream::connect(format!("{master_addr}:{master_port}")).await?;
+) -> Result<(TcpStream, Option<Vec<u8>>), Box<dyn Error + Send + Sync>> {
+    let mut stream = TcpStream::connect(
+        format!("{master_addr}:{master_port}")
+    ).await?;
 
     // (1) PING
     send_and_verify(
@@ -130,9 +127,32 @@ async fn send_handshake(
     ).await?;
 
     // (4) PSYNC ? -1
-    let read_rdb = send_and_process_psync(&mut stream, repl_state).await?;
+    let attached_data = send_and_process_psync(&mut stream, repl_state).await?;
 
-    Ok((stream, read_rdb))
+    Ok((stream, attached_data))
+}
+
+fn process_rdb(rdb: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let n = rdb.len();
+    if let Some(start) = rdb[..n].iter().position(|&c| c == b'$') {
+        if let Some(end) = rdb[start+1..n].windows(2).position(|w| w == b"\r\n") {
+            // Extract length of RDB file
+            let rdb_len: usize = str::from_utf8(
+                &rdb[start+1..start+1+end]
+            ).unwrap().parse().unwrap();
+
+            // (Skip processing file for now)
+
+            let rdb_end = start + end + rdb_len + 3; // '$' + header + '\r\n' + content
+            if n < rdb_end {
+                return Err("Buffer too small".into());
+            }
+
+            return Ok(rdb_end);
+        }
+    }
+
+    Err("Resync failed".into())
 }
 
 async fn process_cmd(
@@ -150,13 +170,36 @@ async fn process_cmd(
     cmd.execute(&client, config, repl_state, db, blocked_clients).await; 
 }
 
+async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client,
+                           config: Config, repl_state: ReplState, db: Database,
+                           blocked_clients: BlockedClients) {
+    let mut cmd_start = start;
+
+    while cmd_start < end {
+        let cmd_len = match buf[cmd_start..end].windows(4).position(
+            |w| w[..3].to_vec() == b"\r\n*" && w[3].is_ascii_digit()
+        ) {
+            Some(pos) => pos + 2, // Account \r\n too
+            None => end - cmd_start // Relative end of buffer
+        };
+
+        let cmd = &buf[cmd_start..cmd_start+cmd_len];
+        process_cmd(
+            cmd, true, client, config.clone(), repl_state.clone(),
+            db.clone(), blocked_clients.clone()
+        ).await;
+
+        cmd_start += cmd_len;
+    }
+}
+
 async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState,
                     db: Database, blocked_clients: BlockedClients) {
     loop {
         // Accept client
         let (socket, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = socket.into_split();
-        let (tx, mut rx) = unbounded_channel();
+        let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
         let client = Client {
             id: get_next_id(),
             tx,
@@ -201,10 +244,10 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
     }
 }
 
-fn run_replica(master_stream: TcpStream, read_rdb: bool, config: Config,
+fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config: Config,
                repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
-    let (mut reader, _) = master_stream.into_split();
-    let (tx, _) = unbounded_channel::<Vec<u8>>();
+    let (mut reader, mut writer) = master_stream.into_split();
+    let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     let client = Client {
         id: 0, // Dummy
         tx,
@@ -212,18 +255,25 @@ fn run_replica(master_stream: TcpStream, read_rdb: bool, config: Config,
         queued_commands: Arc::new(Mutex::new(Vec::new()))
     };
 
+    // Tokio-runtime write task (for ACKs)
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            // Write to master + check for disconnection
+            if writer.write_all(&msg).await.is_err() { break; }
+        }
+    });
+
     // Tokio-runtime read task
     tokio::spawn(async move {
         let mut buf = vec![0; BIG_BUFSIZE];
 
-        if !read_rdb {
-            // Process resync RDB file
-            match reader.read(&mut buf).await {
-                Ok(n) if n > 0 => process_rdb(&buf[..n]),
-                _ => {
-                    eprintln!("Resync failed");
-                    return;
-                }
+        // Process propagated commands received during handshake
+        if let Some(cmd_block) = attached_data {
+            if let Some(star) = cmd_block.iter().position(|&c| c == b'*') {
+                process_cmd_block(
+                    star, cmd_block.len(), &cmd_block, &client, config.clone(),
+                    repl_state.clone(), db.clone(), blocked_clients.clone()
+                ).await;
             }
         }
 
@@ -231,28 +281,10 @@ fn run_replica(master_stream: TcpStream, read_rdb: bool, config: Config,
             // Process propagated commands
             match reader.read(&mut buf).await {
                 Ok(0) => return, // Connection closed
-                Ok(n) => {
-                    // (Might arrive in blocks)
-                    let mut cmd_start = 0;
-                    while cmd_start < n {
-                        let cmd_end = buf[cmd_start+1..n].windows(3).position(
-                            |w| w == b"\r\n*"
-                        ).unwrap_or(n - 2) + 2;
-                        let cmd = &buf[cmd_start..cmd_start+cmd_end];
-                        
-                        process_cmd(
-                            cmd,
-                            true,
-                            &client,
-                            config.clone(),
-                            repl_state.clone(),
-                            db.clone(),
-                            blocked_clients.clone()
-                        ).await;
-
-                        cmd_start = cmd_end;
-                    }
-                }, Err(e) => {
+                Ok(n) => process_cmd_block(
+                    0, n, &buf, &client, config.clone(), repl_state.clone(),
+                    db.clone(), blocked_clients.clone()
+                ).await, Err(e) => {
                     eprintln!("Error: {e}");
                     return;
                 }
@@ -304,8 +336,8 @@ async fn main() {
             config.port,
             repl_state.clone()
         ).await {
-            Ok((stream, read_rdb)) => run_replica(
-                stream, read_rdb, config, repl_state, db, blocked_clients
+            Ok((stream, attached_data)) => run_replica(
+                stream, attached_data, config, repl_state, db, blocked_clients
             ), Err(e) => {
                 eprintln!("Error: {e}");
             }

@@ -1089,7 +1089,8 @@ async fn cmd_discard(to_send: bool, client: &Client) {
     client.send_if(to_send, Response::Ok);
 }
 
-async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state: ReplState) {
+async fn cmd_info(args: Vec<String>, client: &Client, config: Config,
+                  repl_state: ReplState) {
     let info_str: Vec<u8> = match args.len() {
         0 => { todo!(); }, // Default
         1 => { // [Section]
@@ -1103,43 +1104,60 @@ async fn cmd_info(args: Vec<String>, client: &Client, config: Config, repl_state
     client.tx.send(info_str).unwrap();
 }
 
-fn cmd_replconf(_args: Vec<String>, client: &Client, _config: Config, _repl_state: ReplState) {
-    // TODO: Implementation
-    
-    client.tx.send(Response::Ok.into()).unwrap();
+fn cmd_replconf(args: Vec<String>, client: &Client, config: Config,
+                _repl_state: ReplState) {
+    // Handle by role + subcommand
+    let bulk_str = match args.len() {
+        2 => match (
+            config.is_master,
+            args.get(0).unwrap().to_uppercase().as_str()
+        ) {
+            (true, _) => Response::Ok.into(),
+            (false, "GETACK") => {
+                let offset: u64 = 0; // TODO: Calculate offset
+                format!(
+                    "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{offset}\r\n",
+                    offset.to_string().len()
+                ).into_bytes()
+            }, _ => Response::ErrSyntax.into()
+        }, _ => Response::ErrArgCount.into()
+    };
+
+    client.tx.send(bulk_str).unwrap();
 }
 
 async fn cmd_psync(client: &Client, repl_state: ReplState) {
-    {
-        let repl_state_guard = repl_state.lock().await;
-        client.tx.send(format!(
-            "+FULLRESYNC {} {}\r\n", repl_state_guard.replid, repl_state_guard.repl_offset
-        ).into_bytes()).unwrap();
-    }
+    // Decode an empty RDB file to binary + build bulk string
+    let empty_rdb: Vec<u8> = match hex_to_binary(Response::EmptyRDB.into()) {
+        Ok(bin_str) => {
+            let mut bulk_str = Vec::new();
+            bulk_str.extend(format!("${}\r\n", bin_str.len()).as_bytes());
+            bulk_str.extend(&bin_str);
 
-    // Decode an empty RDB to binary
-    let empty_rdb = match hex_to_binary(Response::EmptyRDB.into()) {
-        Ok(bin_content) => bin_content,
-        _ => { 
+            bulk_str
+        },
+        _ => {
             eprintln!("Resync failed");
             return;
         }
     };
 
-    // Build + emit RDB file to replica
-    let mut bulk_str = Vec::new();
-    bulk_str.extend_from_slice(format!("${}\r\n", empty_rdb.len()).as_bytes());
-    bulk_str.extend_from_slice(&empty_rdb);
-
-    client.tx.send(bulk_str).unwrap();
-
+    let mut state_guard = repl_state.lock().await;
     // Store replica's sender
-    let mut repl_state_guard = repl_state.lock().await;
-    if let Some(replicas_arc) = Arc::get_mut(&mut repl_state_guard.replicas) {
+    if let Some(replicas_arc) = Arc::get_mut(&mut state_guard.replicas) {
         if let Some(replica_list) = replicas_arc.as_mut() {
             replica_list.push(client.clone());
         }
     }
+
+    // Emit resync to replica
+    let mut bulk_str = Vec::new();
+    bulk_str.extend(format!(
+        "+FULLRESYNC {} {}\r\n", state_guard.replid, state_guard.repl_offset
+    ).as_bytes());
+    bulk_str.extend(&empty_rdb);
+
+    client.tx.send(bulk_str).unwrap();
 }
 
 fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
@@ -1253,12 +1271,21 @@ impl Command {
     }
 
     fn is_write(&self) -> bool {
+        let uc_name = self.name.to_uppercase();
+        let first_arg = self.args.as_ref()
+            .and_then(|v| v.get(0))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
         matches!(
-            self.name.to_uppercase().as_str(),
+            uc_name.as_str(),
             "SET" | "INCR" | // Keyspace
             "RPUSH" | "LPUSH" | "RPOP" | "LPOP" | // Lists
             "XADD" | // Streams
             "MULTI" | "EXEC" | "DISCARD" // Transactions
+        ) || matches!(
+            (uc_name.as_str(), first_arg),
+            ("REPLCONF", "GETACK") // Acknowledgement
         )
     }
 
