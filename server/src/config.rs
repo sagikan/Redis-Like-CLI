@@ -92,7 +92,7 @@ impl Config_ {
 #[derive(Clone)]
 pub struct ReplState_ {
     pub replid: String,
-    pub repl_offset: u64,
+    pub repl_offset: usize,
     pub replicas: Replicas
 }
 

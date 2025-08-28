@@ -1,16 +1,16 @@
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use tokio::sync::{Mutex, mpsc::UnboundedSender};
 use crate::commands::Command;
 
-static CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
-pub fn get_next_id() -> u64 {
+pub fn get_next_id() -> usize {
     CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone)]
 pub struct Client {
-    pub id: u64,
+    pub id: usize,
     pub tx: UnboundedSender<Vec<u8>>,
     pub in_transaction: Arc<Mutex<bool>>,
     pub queued_commands: Arc<Mutex<Vec<Command>>>
@@ -30,8 +30,8 @@ pub struct BlockedClient {
     pub blocked_by: Vec<String>,
     pub expired: bool,
     pub from_right: Option<bool>, // BPOP
-    pub from_entry_id: Option<(u64, u64)>, // XREAD
-    pub count: Option<u64> // XREAD
+    pub from_entry_id: Option<(usize, usize)>, // XREAD
+    pub count: Option<usize> // XREAD
 }
 
 #[derive(Clone)]

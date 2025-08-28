@@ -13,8 +13,8 @@ pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
 
 #[derive(Clone)]
 pub struct Entry {
-    pub ms_time: u64,
-    pub seq_num: u64,
+    pub ms_time: usize,
+    pub seq_num: usize,
     pub fields: Fields
 }
 
@@ -38,6 +38,6 @@ pub enum ValueType {
 #[derive(Clone)]
 pub enum EntryIdType {
     Full(()),
-    Partial(u64),
-    Explicit((u64, u64))
+    Partial(usize),
+    Explicit((usize, usize))
 }

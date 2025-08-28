@@ -55,7 +55,7 @@ async fn send_and_process_psync(
         .split(' ')
         .collect();
     let (master_replid, master_repl_offset) = match (split.get(1), split.get(2)) {
-        (Some(id), Some(offset)) => (id.to_string(), offset.parse::<u64>()?),
+        (Some(id), Some(offset)) => (id.to_string(), offset.parse::<usize>()?),
         _ => { return Err("Resync failed".into()); }
     };
 
@@ -179,7 +179,7 @@ async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client
         let cmd_len = match buf[cmd_start..end].windows(4).position(
             |w| w[..3].to_vec() == b"\r\n*" && w[3].is_ascii_digit()
         ) {
-            Some(pos) => pos + 2, // Account \r\n too
+            Some(pos) => pos + 2, // Count \r\n too
             None => end - cmd_start // Relative end of buffer
         };
 

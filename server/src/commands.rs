@@ -32,7 +32,7 @@ async fn validate_added_entry_id(
     // Parse + validate
     match entry_id.split_once('-') {
         Some((ms_time, seq_num)) => {
-            match (ms_time.parse::<u64>(), seq_num.parse::<u64>()) {
+            match (ms_time.parse::<usize>(), seq_num.parse::<usize>()) {
                 (Ok(ms_time), Ok(seq_num)) => { // Explicit
                     // Invalidate 0-0
                     if (ms_time, seq_num) == (0, 0) {
@@ -77,13 +77,13 @@ async fn validate_read_entry_id<F: Fn(&String) -> bool>(
     // Parse + validate
     match entry_id.split_once('-') {
         Some((ms_time, seq_num)) => { // Explicit
-            match (ms_time.parse::<u64>(), seq_num.parse::<u64>()) {
+            match (ms_time.parse::<usize>(), seq_num.parse::<usize>()) {
                 (Ok(ms_time), Ok(seq_num)) =>
                     Some(EntryIdType::Explicit((ms_time, seq_num))),
                 _ => invalid_id()
             }
         }, None => { // Partial
-            match entry_id.parse::<u64>() {
+            match entry_id.parse::<usize>() {
                 Ok(ms_time) => Some(EntryIdType::Partial(ms_time)),
                 _ => invalid_id()
             }
@@ -116,7 +116,7 @@ async fn get_last_entry(db: Database, stream_key: &String) -> Option<Entry> {
 }
 
 async fn get_last_seq_entry(db: Database, stream_key: &String,
-                            ms_time: u64) -> Option<Entry> {
+                            ms_time: usize) -> Option<Entry> {
     if let Some(value) = db.lock().await.get_mut(stream_key) {
         if let ValueType::Stream(stream) = &value.val {
             // Iterate from the right to assure max sequence
@@ -130,15 +130,15 @@ async fn get_last_seq_entry(db: Database, stream_key: &String,
     None
 }
 
-fn gen_ms() -> u64 {
+fn gen_ms() -> usize {
     // Return the current UNIX time in ms
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(t) => t.as_millis() as u64,
+        Ok(t) => t.as_millis() as usize,
         _ => panic!("You're a time traveller, Harry!")
     }
 }
 
-async fn gen_seq(db: Database, stream_key: &String, ms_time: u64) -> u64 {
+async fn gen_seq(db: Database, stream_key: &String, ms_time: usize) -> usize {
     match get_last_entry(db.clone(), &stream_key).await {
         Some(last_entry) => {
             if ms_time == last_entry.ms_time { // Same ms_time
@@ -191,7 +191,7 @@ async fn cmd_set(to_send: bool, args: Vec<String>, client: &Client, db: Database
             match args[2].to_uppercase().as_str() {
                 arg @ ("EX" | "PX") => {
                     // Extract expiry time (+ parse to milliseconds, check validity)
-                    let timeout = match args[3].parse::<u64>() {
+                    let timeout = match args[3].parse::<usize>() {
                         Ok(t) if t > 0 => if arg == "EX" { t * 1000 } else { t },
                         _ => {
                             client.send_if(to_send, Response::ErrSetExpireTime);
@@ -340,7 +340,7 @@ async fn cmd_pop(from_right: bool, to_send: bool, args: Vec<String>,
     // Get number of pops based on args length
     let pop_num = match args_len {
         1 => 1,
-        2 => match args[1].parse::<u64>() {
+        2 => match args[1].parse::<usize>() {
             Ok(v) => v,
             _ => {
                 client.send_if(to_send, Response::ErrOutOfRange);
@@ -811,8 +811,8 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
             if args_len < 7 { wrong_args_len(); }
 
             let (c, b) = match (
-                args[1].parse::<u64>(),
-                args[3].parse::<u64>()
+                args[1].parse::<usize>(),
+                args[3].parse::<usize>()
             ) {
                 (Ok(c), Ok(b)) => (c, b),
                 _ => {
@@ -828,7 +828,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
         }, arg_names @ (("COUNT", "STREAMS", _) | ("BLOCK", "STREAMS", _)) => {
             if args_len < 5 { wrong_args_len(); }
 
-            let x = match args[1].parse::<u64>() { // Value of count / block
+            let x = match args[1].parse::<usize>() { // Value of count / block
                 Ok(x) => x,
                 _ => {
                     client.tx.send(Response::ErrNotInteger.into()).unwrap();
@@ -973,7 +973,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
             let tokio_blocked_clients = blocked_clients.clone();
             let tokio_stream_keys = stream_keys.clone();
             tokio::spawn(async move {
-                sleep(Duration::from_millis(block.unwrap())).await;
+                sleep(Duration::from_millis(block.unwrap() as u64)).await;
 
                 let mut still_blocked = false;
                 let mut blocked_clients_guard = tokio_blocked_clients.lock().await;
@@ -1104,8 +1104,8 @@ async fn cmd_info(args: Vec<String>, client: &Client, config: Config,
     client.tx.send(info_str).unwrap();
 }
 
-fn cmd_replconf(args: Vec<String>, client: &Client, config: Config,
-                _repl_state: ReplState) {
+async fn cmd_replconf(args: Vec<String>, client: &Client, config: Config,
+                repl_state: ReplState) {
     // Handle by role + subcommand
     let bulk_str = match args.len() {
         2 => match (
@@ -1114,7 +1114,7 @@ fn cmd_replconf(args: Vec<String>, client: &Client, config: Config,
         ) {
             (true, _) => Response::Ok.into(),
             (false, "GETACK") => {
-                let offset: u64 = 0; // TODO: Calculate offset
+                let offset: usize = repl_state.lock().await.repl_offset;
                 format!(
                     "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{offset}\r\n",
                     offset.to_string().len()
@@ -1175,7 +1175,8 @@ fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
 pub struct Command {
     pub name: String,
     pub args: Option<Vec<String>>,
-    pub is_propagated: bool
+    pub is_propagated: bool,
+    pub resp_len: usize
 }
 
 impl Command {
@@ -1204,7 +1205,8 @@ impl Command {
         Some(Self {
             name: parsed[0].clone(),
             args,
-            is_propagated
+            is_propagated,
+            resp_len: resp_str.len()
         })
     }
 
@@ -1212,19 +1214,13 @@ impl Command {
         &mut self, client: &Client, config: Config, repl_state: ReplState,
         db: Database, blocked_clients: BlockedClients
     ) {
-        let mut to_send = true;
-        if self.is_write() { // Handle propagation
-            if config.is_master {
-                // Propagate command to replicas
-                if let Some(replica_list) = repl_state.lock().await.replicas.as_ref() {
-                    let cmd = self.to_resp_array();
-                    for replica in replica_list {
-                        replica.tx.send(cmd.clone()).unwrap();
-                    }
+        if config.is_master && self.is_write() {
+            // Propagate command to replicas
+            if let Some(replica_list) = repl_state.lock().await.replicas.as_ref() {
+                let cmd = self.to_resp_array();
+                for replica in replica_list {
+                    replica.tx.send(cmd.clone()).unwrap();
                 }
-            } else if self.is_propagated {
-                // Set executable to not reply
-                to_send = false;
             }
         }
         
@@ -1239,11 +1235,11 @@ impl Command {
             return;
         }
 
-        // Extract arguments
+        let to_send = !self.is_propagated; // Propagated => Set executable to not reply
         let args = self.args.take().unwrap_or_else(Vec::new);
 
-        match uc_name.as_str() {
-            "PING"     => client.tx.send(Response::Pong.into()).unwrap(),
+        match uc_name.as_str() { // Handle command
+            "PING"     => client.send_if(to_send, Response::Pong),
             "ECHO"     => cmd_echo(args, &client),
             "SET"      => cmd_set(to_send, args, &client, db).await,
             "GET"      => cmd_get(args, &client, db).await,
@@ -1261,12 +1257,18 @@ impl Command {
             "XREAD"    => cmd_xread(args, &client, db, blocked_clients).await,
             "INCR"     => cmd_incr(to_send, args, &client, db).await,
             "MULTI"    => cmd_multi(to_send, &client).await,
-            "EXEC"     => cmd_exec(to_send, &client, config, repl_state, db, blocked_clients).await,
+            "EXEC"     => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients).await,
             "DISCARD"  => cmd_discard(to_send, &client).await,
-            "INFO"     => cmd_info(args, &client, config, repl_state).await,
-            "REPLCONF" => cmd_replconf(args, &client, config, repl_state),
-            "PSYNC"    => cmd_psync(&client, repl_state).await,
+            "INFO"     => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
+            "REPLCONF" => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
+            "PSYNC"    => cmd_psync(&client, repl_state.clone()).await,
             _          => cmd_other(&self.name, args, &client)
+        }
+
+        if !config.is_master {
+            // Update replication offset
+            let mut state_guard = repl_state.lock().await;
+            state_guard.repl_offset += self.resp_len;
         }
     }
 
