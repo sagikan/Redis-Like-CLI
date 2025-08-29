@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use crate::db::*;
 use crate::config::*;
-use crate::client::{get_next_id, Client, Response};
+use crate::client::{get_next_id, Client_, Client, Response};
 use crate::commands::Command;
 
 static SML_BUFSIZE: usize = 256;
@@ -34,9 +34,9 @@ async fn send_and_verify(
 }
 
 async fn send_and_process_psync(
-    stream: &mut TcpStream, repl_state: ReplState
+    stream: &mut TcpStream, repl_state: &ReplState
 ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
-    let mut buf = vec![0; BIG_BUFSIZE]; // Growable buffer
+    let mut buf = vec![0; BIG_BUFSIZE];
 
     // Write/read to/from stream + verify reponse
     stream.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n").await?;
@@ -127,7 +127,7 @@ async fn send_handshake(
     ).await?;
 
     // (4) PSYNC ? -1
-    let attached_data = send_and_process_psync(&mut stream, repl_state).await?;
+    let attached_data = send_and_process_psync(&mut stream, &repl_state).await?;
 
     Ok((stream, attached_data))
 }
@@ -200,12 +200,12 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
         let (socket, _) = listener.accept().await.unwrap();
         let (mut reader, mut writer) = socket.into_split();
         let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-        let client = Client {
+        let client = Arc::new(Client_ {
             id: get_next_id(),
             tx,
             in_transaction: Arc::new(Mutex::new(false)),
             queued_commands: Arc::new(Mutex::new(Vec::new()))
-        };
+        });
 
         // Tokio-runtime write task
         tokio::spawn(async move {
@@ -228,7 +228,7 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
                     Ok(0) => return, // Connection closed
                     Ok(n) => process_cmd(
                         &buf[..n],
-                        false,
+                        false, // Not propagated
                         &client,
                         tokio_config.clone(),
                         tokio_repl_state.clone(),
@@ -248,12 +248,12 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
                repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
     let (mut reader, mut writer) = master_stream.into_split();
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-    let client = Client {
+    let client = Arc::new(Client_ {
         id: 0, // Dummy
         tx,
         in_transaction: Arc::new(Mutex::new(false)),
         queued_commands: Arc::new(Mutex::new(Vec::new()))
-    };
+    });
 
     // Tokio-runtime write task (for ACKs)
     tokio::spawn(async move {
@@ -271,8 +271,14 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
         if let Some(cmd_block) = attached_data {
             if let Some(star) = cmd_block.iter().position(|&c| c == b'*') {
                 process_cmd_block(
-                    star, cmd_block.len(), &cmd_block, &client, config.clone(),
-                    repl_state.clone(), db.clone(), blocked_clients.clone()
+                    star, // Start
+                    cmd_block.len(), // End
+                    &cmd_block,
+                    &client,
+                    config.clone(),
+                    repl_state.clone(),
+                    db.clone(),
+                    blocked_clients.clone()
                 ).await;
             }
         }
@@ -282,8 +288,14 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
             match reader.read(&mut buf).await {
                 Ok(0) => return, // Connection closed
                 Ok(n) => process_cmd_block(
-                    0, n, &buf, &client, config.clone(), repl_state.clone(),
-                    db.clone(), blocked_clients.clone()
+                    0, // Start
+                    n, // End
+                    &buf,
+                    &client,
+                    config.clone(),
+                    repl_state.clone(),
+                    db.clone(),
+                    blocked_clients.clone()
                 ).await, Err(e) => {
                     eprintln!("Error: {e}");
                     return;
@@ -299,10 +311,8 @@ async fn main() {
     let config = Arc::new(Config_::from(env::args().skip(1).collect()));
     let repl_state = if config.is_master {
         let repl_state = ReplState::default();
-        {
-            let mut state = repl_state.lock().await;
-            state.replicas = Arc::new(Some(Vec::new()));
-        }
+        // Initialize replica list
+        repl_state.lock().await.replicas = Some(Vec::new());
 
         repl_state
     } else {

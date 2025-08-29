@@ -9,7 +9,7 @@ use tokio::sync::MutexGuard;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
 use crate::config::{Config, ReplState};
-use crate::client::{Client, BlockedClient, Response};
+use crate::client::{Client, BlockedClient, ReplicaClient, Response};
 
 fn set_pair(key: String, value: Value, client: &Client, to_send: bool,
             mut guard: MutexGuard<'_, HashMap<String, Value>>) {
@@ -159,7 +159,7 @@ fn hex_to_binary(hex_vec: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(bin_vec)
 }
 
-fn cmd_echo(args: Vec<String>, client: &Client) {
+fn cmd_echo(args: &[String], client: &Client) {
     if let Some(_val) = args.get(0) {
         let to_write = format!("+{}\r\n", args[0..].join(" "));
         client.tx.send(to_write.into_bytes()).unwrap();
@@ -168,7 +168,7 @@ fn cmd_echo(args: Vec<String>, client: &Client) {
     }
 }
 
-async fn cmd_set(to_send: bool, args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_set(to_send: bool, args: &[String], client: &Client, db: Database) {
     let guard = db.lock().await;
 
     match args.len() {
@@ -215,7 +215,7 @@ async fn cmd_set(to_send: bool, args: Vec<String>, client: &Client, db: Database
     }
 }
 
-async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_get(args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
@@ -235,7 +235,7 @@ async fn cmd_get(args: Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val}\r\n").into_bytes()).unwrap();
 }
 
-async fn cmd_push(from_right: bool, to_send: bool, args: Vec<String>,
+async fn cmd_push(from_right: bool, to_send: bool, args: &[String],
                   client: &Client, db: Database, blocked_clients: BlockedClients) {
     if args.len() < 2 {
         client.send_if(to_send, Response::ErrArgCount);
@@ -328,7 +328,7 @@ async fn cmd_push(from_right: bool, to_send: bool, args: Vec<String>,
     client.send_if(to_send, format!(":{stored_val_list_len}\r\n").into_bytes());
 }
 
-async fn cmd_pop(from_right: bool, to_send: bool, args: Vec<String>,
+async fn cmd_pop(from_right: bool, to_send: bool, args: &[String],
                  client: &Client, db: Database) {
     let args_len = args.len();
     if args_len != 1 && args_len != 2 {
@@ -385,7 +385,7 @@ async fn cmd_pop(from_right: bool, to_send: bool, args: Vec<String>,
     }    
 }
 
-async fn cmd_bpop(from_right: bool, to_send: bool, args: Vec<String>,
+async fn cmd_bpop(from_right: bool, to_send: bool, args: &[String],
                   client: &Client, db: Database, blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 2 {
@@ -468,13 +468,13 @@ async fn cmd_bpop(from_right: bool, to_send: bool, args: Vec<String>,
             }
 
             if still_blocked {
-                tokio_client.send_if(to_send, Response::Nil);
+                tokio_client.send_if(to_send, Response::NilArray);
             }
         });
     }
 }
 
-async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_lrange(args: &[String], client: &Client, db: Database) {
     if args.len() != 3 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
@@ -526,7 +526,7 @@ async fn cmd_lrange(args: Vec<String>, client: &Client, db: Database) {
     }
 }
 
-async fn cmd_llen(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_llen(args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
@@ -547,7 +547,7 @@ async fn cmd_llen(args: Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!(":{val_list_len}\r\n").into_bytes()).unwrap();
 }
 
-async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_type(args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
@@ -564,7 +564,7 @@ async fn cmd_type(args: Vec<String>, client: &Client, db: Database) {
     client.tx.send(format!("+{val_type}\r\n").into_bytes()).unwrap();
 }
 
-async fn cmd_xadd(to_send: bool, args: Vec<String>, client: &Client, db: Database,
+async fn cmd_xadd(to_send: bool, args: &[String], client: &Client, db: Database,
                   blocked_clients: BlockedClients) {
     let args_len = args.len();
     if args_len < 4 || args_len % 2 == 1 {
@@ -700,7 +700,7 @@ async fn cmd_xadd(to_send: bool, args: Vec<String>, client: &Client, db: Databas
     ).into_bytes());
 }
 
-async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_xrange(args: &[String], client: &Client, db: Database) {
     if args.len() != 3 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
@@ -789,7 +789,7 @@ async fn cmd_xrange(args: Vec<String>, client: &Client, db: Database) {
     }
 }
 
-async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
+async fn cmd_xread(args: &[String], client: &Client, db: Database,
                    blocked_clients: BlockedClients) {
     let args_len = args.len();
     let wrong_args_len = || {
@@ -989,7 +989,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
                 }
 
                 if still_blocked {
-                    tokio_client.tx.send(Response::Nil.into()).unwrap();
+                    tokio_client.tx.send(Response::NilArray.into()).unwrap();
                 }
             });
         }
@@ -999,7 +999,7 @@ async fn cmd_xread(args: Vec<String>, client: &Client, db: Database,
     }
 }
 
-async fn cmd_incr(to_send: bool, args: Vec<String>, client: &Client, db: Database) {
+async fn cmd_incr(to_send: bool, args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.send_if(to_send, Response::ErrArgCount);
         return;
@@ -1089,7 +1089,7 @@ async fn cmd_discard(to_send: bool, client: &Client) {
     client.send_if(to_send, Response::Ok);
 }
 
-async fn cmd_info(args: Vec<String>, client: &Client, config: Config,
+async fn cmd_info(args: &[String], client: &Client, config: Config,
                   repl_state: ReplState) {
     let info_str: Vec<u8> = match args.len() {
         0 => { todo!(); }, // Default
@@ -1104,17 +1104,33 @@ async fn cmd_info(args: Vec<String>, client: &Client, config: Config,
     client.tx.send(info_str).unwrap();
 }
 
-async fn cmd_replconf(args: Vec<String>, client: &Client, config: Config,
-                repl_state: ReplState) {
+async fn cmd_replconf(args: &[String], client: &Client, config: Config,
+                      repl_state: ReplState) {
     // Handle by role + subcommand
     let bulk_str = match args.len() {
         2 => match (
             config.is_master,
-            args.get(0).unwrap().to_uppercase().as_str()
+            args[0].to_uppercase().as_str(),
+            args[1].as_str(),
         ) {
-            (true, _) => Response::Ok.into(),
-            (false, "GETACK") => {
+            (true, "ACK", offset_str) => match offset_str.parse::<usize>() {
+                Ok(offset) => {
+                    // Update replica's offset in list
+                    if let Some(replica_list) = &mut repl_state.lock().await.replicas {
+                        if let Some(replica) = replica_list.iter_mut().find(
+                            |r| r.client.tx.same_channel(&client.tx) && r.handshaked
+                        ) {
+                            replica.ack_offset = offset;
+                        }
+                    }
+
+                    return; // No reply
+                }, Err(_) => Response::ErrSyntax.into()
+            },
+            (true, _, _) => Response::Ok.into(), // listening-port / capa
+            (false, "GETACK", "*") => {
                 let offset: usize = repl_state.lock().await.repl_offset;
+
                 format!(
                     "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{offset}\r\n",
                     offset.to_string().len()
@@ -1143,11 +1159,13 @@ async fn cmd_psync(client: &Client, repl_state: ReplState) {
     };
 
     let mut state_guard = repl_state.lock().await;
-    // Store replica's sender
-    if let Some(replicas_arc) = Arc::get_mut(&mut state_guard.replicas) {
-        if let Some(replica_list) = replicas_arc.as_mut() {
-            replica_list.push(client.clone());
-        }
+    // Store replica info before ACK
+    if let Some(replica_list) = &mut state_guard.replicas {
+        replica_list.push(ReplicaClient {
+            client: client.clone(),
+            handshaked: false,
+            ack_offset: 0
+        });
     }
 
     // Emit resync to replica
@@ -1160,7 +1178,78 @@ async fn cmd_psync(client: &Client, repl_state: ReplState) {
     client.tx.send(bulk_str).unwrap();
 }
 
-fn cmd_other(cmd_name: &String, args: Vec<String>, client: &Client) {
+async fn cmd_wait(args: &[String], client: &Client, repl_state: ReplState) {
+    {
+        let state_guard = repl_state.lock().await;
+        let replicas = state_guard.replicas.as_ref();
+        if replicas.is_none() || replicas.as_ref().unwrap().is_empty() {
+            // No connected replicas
+            client.tx.send(b":0\r\n".to_vec()).unwrap();
+            return;
+        }
+    }
+    
+    if args.len() != 2 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    let last_write = { repl_state.lock().await.repl_offset };
+    // Handle by number of replicas + timeout
+    let acknowledged = match (args[0].parse::<usize>(), args[1].parse::<usize>()) {
+        (Ok(0), Ok(_)) => { // Immediate
+            let state_guard = repl_state.lock().await;
+            let replicas = state_guard.replicas.as_ref().unwrap();
+
+            replicas.iter().filter(
+                |repl| repl.ack_offset >= last_write // Acknowledgement check
+            ).collect::<Vec<&ReplicaClient>>().len()
+        }, (Ok(num_repl), Ok(timeout)) => { // Blocking
+            let sleeper = tokio::spawn(async move {
+                sleep(Duration::from_millis(timeout as u64)).await;
+            });
+
+            let mut ack = 0;
+            // Block until replica number reached / (if > 0) timeout expires
+            while ack < num_repl && (timeout == 0 || !sleeper.is_finished()) {
+                ack = 0; // Reset
+
+                // Get snapshot of replica list
+                let replicas = {
+                    let state_guard = repl_state.lock().await;
+                    state_guard.replicas.as_ref().unwrap().clone()
+                };
+
+                let mut sent_getack = false;
+                for repl in replicas {
+                    if repl.ack_offset >= last_write { // Acknowledgement check
+                        ack += 1;
+                    } else if ack < num_repl {
+                        // Dispatch GETACK to replica for offset update
+                        repl.client.tx.send(
+                            b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+                        .to_vec()).unwrap();
+                        sent_getack = true;
+                    }
+                }
+                
+                if sent_getack { // Allow catch-up
+                    sleep(Duration::from_millis(100)).await; 
+                }
+            }
+
+            ack
+        }, _ => {
+            client.tx.send(Response::ErrNotInteger.into()).unwrap();
+            return;
+        }
+    };
+
+    // Emit number of up-to-last-write replicas
+    client.tx.send(format!(":{acknowledged}\r\n").into_bytes()).unwrap();
+}
+
+fn cmd_other(cmd_name: &String, args: &[String], client: &Client) {
     // Build + emit error string
     let mut err_str = format!("-ERR unknown command '{cmd_name}', with args beginning with: ");
     for arg in &args[0..] {
@@ -1216,10 +1305,10 @@ impl Command {
     ) {
         if config.is_master && self.is_write() {
             // Propagate command to replicas
-            if let Some(replica_list) = repl_state.lock().await.replicas.as_ref() {
+            if let Some(replica_list) = &repl_state.lock().await.replicas {
                 let cmd = self.to_resp_array();
-                for replica in replica_list {
-                    replica.tx.send(cmd.clone()).unwrap();
+                for repl in replica_list {
+                    repl.client.tx.send(cmd.clone()).unwrap();
                 }
             }
         }
@@ -1235,10 +1324,11 @@ impl Command {
             return;
         }
 
-        let to_send = !self.is_propagated; // Propagated => Set executable to not reply
-        let args = self.args.take().unwrap_or_else(Vec::new);
+        let to_send = !self.is_propagated; // Propagated => Executable not replying
+        let args = self.args.as_deref().unwrap_or(&[]);
 
-        match uc_name.as_str() { // Handle command
+        // Handle command
+        match uc_name.as_str() {
             "PING"     => client.send_if(to_send, Response::Pong),
             "ECHO"     => cmd_echo(args, &client),
             "SET"      => cmd_set(to_send, args, &client, db).await,
@@ -1262,32 +1352,35 @@ impl Command {
             "INFO"     => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
             "REPLCONF" => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
             "PSYNC"    => cmd_psync(&client, repl_state.clone()).await,
+            "WAIT"     => cmd_wait(args, &client, repl_state.clone()).await,
             _          => cmd_other(&self.name, args, &client)
         }
 
-        if !config.is_master {
-            // Update replication offset
-            let mut state_guard = repl_state.lock().await;
+        let mut state_guard = repl_state.lock().await;
+        // Update offset
+        if (config.is_master && self.is_write()) || self.is_propagated {
             state_guard.repl_offset += self.resp_len;
+        }
+
+        // Update handshake state
+        if uc_name.as_str() == "PSYNC" {
+            if let Some(replica_list) = &mut state_guard.replicas {
+                if let Some(replica) = replica_list.iter_mut().find(
+                    |r| r.client.tx.same_channel(&client.tx)
+                ) {
+                    replica.handshaked = true;
+                }
+            }
         }
     }
 
     fn is_write(&self) -> bool {
-        let uc_name = self.name.to_uppercase();
-        let first_arg = self.args.as_ref()
-            .and_then(|v| v.get(0))
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
         matches!(
-            uc_name.as_str(),
+            self.name.to_uppercase().as_str(),
             "SET" | "INCR" | // Keyspace
             "RPUSH" | "LPUSH" | "RPOP" | "LPOP" | // Lists
             "XADD" | // Streams
             "MULTI" | "EXEC" | "DISCARD" // Transactions
-        ) || matches!(
-            (uc_name.as_str(), first_arg),
-            ("REPLCONF", "GETACK") // Acknowledgement
         )
     }
 

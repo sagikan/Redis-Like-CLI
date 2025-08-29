@@ -2,15 +2,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use rand::{rng, Rng};
 use rand::distr::Alphanumeric;
-use crate::client::Client;
+use crate::client::ReplicaClient;
 
 static DEF_PORT: u16 = 6379;
 
 pub type Config = Arc<Config_>;
 
 pub type ReplState = Arc<Mutex<ReplState_>>;
-
-pub type Replicas = Arc<Option<Vec<Client>>>;
 
 fn gen_rand_str() -> String {
     // Generate a pseudo-random alphanumeric string of 40 characters
@@ -93,7 +91,7 @@ impl Config_ {
 pub struct ReplState_ {
     pub replid: String,
     pub repl_offset: usize,
-    pub replicas: Replicas
+    pub replicas: Option<Vec<ReplicaClient>>
 }
 
 impl Default for ReplState_ {
@@ -101,7 +99,7 @@ impl Default for ReplState_ {
         Self {
             replid: gen_rand_str(),
             repl_offset: 0,
-            replicas: Replicas::default() // None
+            replicas: None
         }
     }
 }

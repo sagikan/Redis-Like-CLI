@@ -4,19 +4,21 @@ use crate::commands::Command;
 
 static CLIENT_ID: AtomicUsize = AtomicUsize::new(1);
 
+pub type Client = Arc<Client_>;
+
 pub fn get_next_id() -> usize {
     CLIENT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Clone)]
-pub struct Client {
+pub struct Client_ {
     pub id: usize,
     pub tx: UnboundedSender<Vec<u8>>,
     pub in_transaction: Arc<Mutex<bool>>,
     pub queued_commands: Arc<Mutex<Vec<Command>>>
 }
 
-impl Client {
+impl Client_ {
     pub fn send_if(&self, to_send: bool, msg: impl Into<Vec<u8>>) {
         if to_send {
             self.tx.send(msg.into()).unwrap();
@@ -32,6 +34,13 @@ pub struct BlockedClient {
     pub from_right: Option<bool>, // BPOP
     pub from_entry_id: Option<(usize, usize)>, // XREAD
     pub count: Option<usize> // XREAD
+}
+
+#[derive(Clone)]
+pub struct ReplicaClient {
+    pub client: Client,
+    pub handshaked: bool,
+    pub ack_offset: usize
 }
 
 #[derive(Clone)]
@@ -55,6 +64,7 @@ pub enum Response {
     ErrEntryIdInvalid,
     WrongType,
     EmptyArray,
+    NilArray,
     Nil,
     EmptyRDB
 }
@@ -81,6 +91,7 @@ impl From<Response> for Vec<u8> {
             Response::ErrEntryIdInvalid => &b"-ERR Invalid stream ID specified as stream command argument\r\n"[..],
             Response::WrongType => &b"-WRONGTYPE Operation against a key holding a wrong kind of value\r\n"[..],
             Response::EmptyArray => &b"*0\r\n"[..],
+            Response::NilArray => &b"*-1\r\n"[..],
             Response::Nil => &b"$-1\r\n"[..],
             Response::EmptyRDB => &b"524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"[..]
         }.to_vec()
