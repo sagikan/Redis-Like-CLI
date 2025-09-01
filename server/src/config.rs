@@ -4,7 +4,10 @@ use rand::{rng, Rng};
 use rand::distr::Alphanumeric;
 use crate::client::ReplicaClient;
 
+static DEF_BIND: &str = "127.0.0.1";
 static DEF_PORT: u16 = 6379;
+pub static DEF_DB_DIR: &str = ".";
+pub static DEF_DB_FILE: &str = "dump.rdb";
 
 pub type Config = Arc<Config_>;
 
@@ -25,17 +28,21 @@ pub struct Config_ {
     pub port: u16,
     pub is_master: bool,
     pub master_addr: Option<String>,
-    pub master_port: Option<u16>
+    pub master_port: Option<u16>,
+    pub dir: String,
+    pub dbfilename: String
 }
 
 impl Default for Config_ {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1".to_string(),
+            bind_addr: DEF_BIND.to_string(),
             port: DEF_PORT,
             is_master: true,
             master_addr: None,
-            master_port: None
+            master_port: None,
+            dir: DEF_DB_DIR.to_string(),
+            dbfilename: DEF_DB_FILE.to_string()
         }
     }
 }
@@ -45,23 +52,30 @@ impl Config_ {
     pub fn from(args: Vec<String>) -> Self {
         let mut config = Config_::default();
         
+        let args_len = args.len();
         let mut i = 0;
-        while i < args.len() {
+        while i < args_len {
             // Extract argument(s) after a command option
             match args[i].as_str() {
-                "--bind" if i + 1 < args.len() => {
+                "--bind" if i + 1 < args_len => {
                     config.bind_addr = args[i + 1].clone();
                     i += 2; // Skip
-                }, "--port" if i + 1 < args.len() => {
+                }, "--port" if i + 1 < args_len => {
                     config.port = args[i + 1].parse().unwrap_or(DEF_PORT);
                     i += 2; // Skip
-                }, "--replicaof" if i + 1 < args.len() => {
+                }, "--replicaof" if i + 1 < args_len => {
                     let split: Vec<&str> = args[i + 1].split_whitespace().collect();
                     if split.len() == 2 {
                         config.is_master = false;
                         config.master_addr = Some(split[0].to_string());
                         config.master_port = Some(split[1].parse().unwrap_or(DEF_PORT));
                     }
+                    i += 2; // Skip
+                }, "--dir" if i + 1 < args_len => {
+                    config.dir = args[i + 1].clone();
+                    i += 2; // Skip
+                }, "--dbfilename" if i + 1 < args_len => {
+                    config.dbfilename = args[i + 1].clone();
                     i += 2; // Skip
                 }, _ => i += 1
             }

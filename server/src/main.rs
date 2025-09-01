@@ -2,6 +2,7 @@ mod db;
 mod config;
 mod client;
 mod commands;
+mod rdb;
 
 use std::env;
 use std::str;
@@ -10,10 +11,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc::unbounded_channel, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use crate::db::*;
-use crate::config::*;
+use crate::db::{Database, BlockedClients};
+use crate::config::{Config, Config_, ReplState};
 use crate::client::{get_next_id, Client_, Client, Response};
 use crate::commands::Command;
+use crate::rdb::RDBFile;
 
 static SML_BUFSIZE: usize = 256;
 static BIG_BUFSIZE: usize = 1024;
@@ -23,7 +25,7 @@ async fn send_and_verify(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buf = [0; SML_BUFSIZE];
 
-    // Write/read to/from stream + verify reponse
+    // Write/read to/from stream + verify response
     stream.write_all(&to_write).await?;
     let bytes_read = stream.read(&mut buf).await?;
     if buf[..bytes_read] != expected[..] {
@@ -34,7 +36,7 @@ async fn send_and_verify(
 }
 
 async fn send_and_process_psync(
-    stream: &mut TcpStream, repl_state: &ReplState
+    stream: &mut TcpStream, repl_state: ReplState, db: Database
 ) -> Result<Option<Vec<u8>>, Box<dyn Error + Send + Sync>> {
     let mut buf = vec![0; BIG_BUFSIZE];
 
@@ -67,8 +69,8 @@ async fn send_and_process_psync(
     
     // Process RDB file
     let rdb_start = resync_end + 2;
-    let rdb_end = loop { // Try
-        match process_rdb(&buf[rdb_start..n]) {
+    let rdb_end = loop { // Try processing
+        match process_rdb(&buf[rdb_start..n], db.clone()).await {
             Ok(rel_end) => break rdb_start + rel_end, // Absolute end value
             _ => { // Read more data
                 buf.resize(n + BIG_BUFSIZE, 0);
@@ -92,8 +94,12 @@ async fn send_and_process_psync(
 }
 
 async fn send_handshake(
-    master_addr: &String, master_port: u16, port: u16, repl_state: ReplState
+    config: Config, repl_state: ReplState, db: Database
 ) -> Result<(TcpStream, Option<Vec<u8>>), Box<dyn Error + Send + Sync>> {
+    let master_addr = config.master_addr.as_ref().unwrap();
+    let master_port = config.master_port.unwrap();
+    let port = config.port;
+
     let mut stream = TcpStream::connect(
         format!("{master_addr}:{master_port}")
     ).await?;
@@ -127,26 +133,35 @@ async fn send_handshake(
     ).await?;
 
     // (4) PSYNC ? -1
-    let attached_data = send_and_process_psync(&mut stream, &repl_state).await?;
+    let attached_data = send_and_process_psync(&mut stream, repl_state, db).await?;
 
     Ok((stream, attached_data))
 }
 
-fn process_rdb(rdb: &[u8]) -> Result<usize, Box<dyn Error + Send + Sync>> {
+async fn process_rdb(
+    rdb: &[u8], db: Database
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let n = rdb.len();
-    if let Some(start) = rdb[..n].iter().position(|&c| c == b'$') {
-        if let Some(end) = rdb[start+1..n].windows(2).position(|w| w == b"\r\n") {
+    if let Some(d_start) = rdb[..n].iter().position(|&c| c == b'$') {
+        if let Some(d_end) = rdb[d_start+1..n].windows(2).position(|w| w == b"\r\n") {
             // Extract length of RDB file
             let rdb_len: usize = str::from_utf8(
-                &rdb[start+1..start+1+end]
+                &rdb[d_start+1..d_start+1+d_end]
             ).unwrap().parse().unwrap();
 
-            // (Skip processing file for now)
-
-            let rdb_end = start + end + rdb_len + 3; // '$' + header + '\r\n' + content
+            let rdb_start = d_start + d_end + 3; // '$' + header + '\r\n'
+            let rdb_end = rdb_start + rdb_len;
             if n < rdb_end {
                 return Err("Buffer too small".into());
             }
+
+            let rdb_file = RDBFile::from_vec(rdb[rdb_start..rdb_end].to_vec())?;
+            // Insert RDB entries into the existing DB
+            db.lock().await.extend(
+                Database::from(rdb_file).await?.inner().lock().await.iter().map(
+                    |(k, v)| (k.clone(), v.clone())
+                )
+            );
 
             return Ok(rdb_end);
         }
@@ -306,7 +321,7 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Set server configuration + DBs
     let config = Arc::new(Config_::from(env::args().skip(1).collect()));
     let repl_state = if config.is_master {
@@ -315,16 +330,16 @@ async fn main() {
         repl_state.lock().await.replicas = Some(Vec::new());
 
         repl_state
-    } else {
-        ReplState::default() // Updated during handshake
-    };
-    let db = Database::default();
+    } else { ReplState::default() }; // (Updated during handshake)
+    let db = if config.is_master {
+        Database::from(RDBFile::from(&config.dir, &config.dbfilename)?).await?
+    } else { Database::default() }; // (Updated during handshake)
     let blocked_clients = BlockedClients::default();
 
     // Set listener
     let listener = TcpListener::bind(format!(
         "{}:{}", config.bind_addr, config.port
-    )).await.unwrap();
+    )).await?;
 
     // Run server-side
     let tokio_config = config.clone();
@@ -341,10 +356,9 @@ async fn main() {
     if !config.is_master {
         // Initiate handshake with master
         match send_handshake(
-            config.master_addr.as_ref().unwrap(),
-            config.master_port.unwrap(),
-            config.port,
-            repl_state.clone()
+            config.clone(),
+            repl_state.clone(),
+            db.clone()
         ).await {
             Ok((stream, attached_data)) => run_replica(
                 stream, attached_data, config, repl_state, db, blocked_clients
@@ -354,5 +368,6 @@ async fn main() {
         }
     }
 
-    server_handler.await.unwrap(); // Keep-Alive
+    server_handler.await?; // Keep-Alive
+    unreachable!()
 }

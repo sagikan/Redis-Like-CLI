@@ -1,15 +1,14 @@
-use std::error::Error;
 use std::str;
 use std::cmp::min;
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use hex;
 use tokio::sync::MutexGuard;
 use tokio::time::{sleep, Duration};
 use crate::db::*;
 use crate::config::{Config, ReplState};
 use crate::client::{Client, BlockedClient, ReplicaClient, Response};
+use crate::rdb::RDBFile;
 
 fn set_pair(key: String, value: Value, client: &Client, to_send: bool,
             mut guard: MutexGuard<'_, HashMap<String, Value>>) {
@@ -152,11 +151,47 @@ async fn gen_seq(db: Database, stream_key: &String, ms_time: usize) -> usize {
     }
 }
 
-fn hex_to_binary(hex_vec: Vec<u8>) -> Result<Vec<u8>, Box<dyn Error>> {
-    let hex_str = str::from_utf8(&hex_vec)?;
-    let bin_vec = hex::decode(hex_str)?;
+fn glob(pattern: &[u8], key: &[u8]) -> bool {
+    let (mut pat_i, mut key_i) = (0, 0);
+    let (mut star_pat, mut star_key) = (None, 0);
+    let (pat_len, key_len) = (pattern.len(), key.len());
 
-    Ok(bin_vec)
+    while key_i < key_len {
+        if pat_i < pat_len {
+            match pattern[pat_i] {
+                b'*' => {
+                    // Collapse chained *s
+                    while pat_i < pat_len && pattern[pat_i] == b'*' { pat_i += 1; }
+                    if pat_i == pat_len { // Trailing *
+                        return true;
+                    }
+                    // Record positions
+                    star_pat = Some(pat_i);
+                    star_key = key_i;
+                    continue;
+                }, c if c.is_ascii_alphanumeric() => {
+                    if c == key[key_i] { // Matching
+                        // Advance
+                        key_i += 1;
+                        pat_i += 1;
+                        continue;
+                    }
+                }, _ => todo!()
+            }
+        }
+
+        // Mismatch
+        if let Some(pat_j) = star_pat {
+            star_key += 1; // Absorb 1 character in key
+            // Fallback
+            key_i = star_key;
+            pat_i = pat_j;
+        } else { // No fallback option
+            return false;
+        }
+    }
+
+    pat_i == pat_len
 }
 
 fn cmd_echo(args: &[String], client: &Client) {
@@ -174,11 +209,17 @@ async fn cmd_set(to_send: bool, args: &[String], client: &Client, db: Database) 
     match args.len() {
         2 => { // [Key] [Value]
             let key = args[0].clone();
-            let value = Value { val: ValueType::String(args[1].clone()) };
+            let value = Value {
+                val: ValueType::String(args[1].clone()),
+                exp: None
+            };
             set_pair(key, value, &client, to_send, guard);
         }, 3 => { // [Key] [Value] [NX / XX]
             let key = args[0].clone();
-            let value = Value { val: ValueType::String(args[1].clone()) };
+            let value = Value {
+                val: ValueType::String(args[1].clone()),
+                exp: None
+            };
             // Set only if NX + key doesn't exist OR if XX + key exists
             match (
                 args[2].to_uppercase().as_str(), guard.contains_key(&key)
@@ -200,7 +241,14 @@ async fn cmd_set(to_send: bool, args: &[String], client: &Client, db: Database) 
                     };
 
                     let key = args[0].clone();
-                    let value = Value { val: ValueType::String(args[1].clone()) };
+                    let value = Value {
+                        val: ValueType::String(args[1].clone()),
+                        exp: Some(match arg {
+                            "EX" => ExpiryType::Seconds(timeout),
+                            "PX" => ExpiryType::Milliseconds(timeout),
+                            _ => unreachable!()
+                        })
+                    };
 
                     // Insert + employ active expiration via Tokio-runtime
                     set_pair(key.clone(), value, &client, to_send, guard);
@@ -316,7 +364,10 @@ async fn cmd_push(from_right: bool, to_send: bool, args: &[String],
         }, None => {
             // Create and insert list if there are values to push
             if val_list.len() > 0 {
-                let value = Value { val: ValueType::StringList(val_list) };
+                let value = Value {
+                    val: ValueType::StringList(val_list),
+                    exp: None
+                };
                 guard.insert(key.clone(), value);
             }
 
@@ -613,7 +664,10 @@ async fn cmd_xadd(to_send: bool, args: &[String], client: &Client, db: Database,
                 let entries = Entries::default();
                 // Insert entry + create stream
                 entries.lock().await.push_back(entry);
-                let stream = Value { val: ValueType::Stream(Stream { entries }) };
+                let stream = Value {
+                    val: ValueType::Stream(Stream { entries }),
+                    exp: None
+                };
                 // Insert stream
                 guard.insert(stream_key.clone(), stream);
             }
@@ -1028,7 +1082,10 @@ async fn cmd_incr(to_send: bool, args: &[String], client: &Client, db: Database)
         }, None => { // Key doesn't exist
             // Set value to 1 + insert pair
             let res = "1".to_string();
-            let value = Value { val: ValueType::String(res.clone()) };
+            let value = Value {
+                val: ValueType::String(res.clone()),
+                exp: None
+            };
             guard.insert(key.clone(), value);
             
             res
@@ -1143,20 +1200,7 @@ async fn cmd_replconf(args: &[String], client: &Client, config: Config,
 }
 
 async fn cmd_psync(client: &Client, repl_state: ReplState) {
-    // Decode an empty RDB file to binary + build bulk string
-    let empty_rdb: Vec<u8> = match hex_to_binary(Response::EmptyRDB.into()) {
-        Ok(bin_str) => {
-            let mut bulk_str = Vec::new();
-            bulk_str.extend(format!("${}\r\n", bin_str.len()).as_bytes());
-            bulk_str.extend(&bin_str);
-
-            bulk_str
-        },
-        _ => {
-            eprintln!("Resync failed");
-            return;
-        }
-    };
+    let empty_rdb: Vec<u8> = RDBFile::default().to_vec();
 
     let mut state_guard = repl_state.lock().await;
     // Store replica info before ACK
@@ -1173,6 +1217,7 @@ async fn cmd_psync(client: &Client, repl_state: ReplState) {
     bulk_str.extend(format!(
         "+FULLRESYNC {} {}\r\n", state_guard.replid, state_guard.repl_offset
     ).as_bytes());
+    bulk_str.extend(format!("${}\r\n", empty_rdb.len()).as_bytes());
     bulk_str.extend(&empty_rdb);
 
     client.tx.send(bulk_str).unwrap();
@@ -1247,6 +1292,64 @@ async fn cmd_wait(args: &[String], client: &Client, repl_state: ReplState) {
 
     // Emit number of up-to-last-write replicas
     client.tx.send(format!(":{acknowledged}\r\n").into_bytes()).unwrap();
+}
+
+fn cmd_config_get(args: &[String], client: &Client, config: Config) {
+    if args.len() != 1 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    // Extract + emit key and value
+    let key = &args[0];
+    let val = match key.to_uppercase().as_str() {
+        "DIR" => &config.dir,
+        "DBFILENAME" => &config.dbfilename,
+        _ => {
+            client.tx.send(Response::NilArray.into()).unwrap();
+            return;
+        }
+    };
+
+    client.tx.send(format!(
+        "*2\r\n${}\r\n{key}\r\n${}\r\n{val}\r\n", key.len(), val.len()
+    ).into_bytes()).unwrap();
+}
+
+fn grp_config(args: &[String], client: &Client, config: Config) {
+    if args.is_empty() { // No subcommand
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    match args[0].to_uppercase().as_str() {
+        "GET" => cmd_config_get(&args[1..], &client, config.clone()),
+        _ => todo!()
+    }
+}
+
+async fn cmd_keys(args: &[String], client: &Client, db: Database) {
+    if args.len() != 1 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    let pattern = args[0].trim_matches('"'); // Remove "s
+    
+    let mut matching: Vec<&String> = Vec::new();
+    let mut bulk_str = String::new();
+    let guard = db.lock().await;
+    // Match key to pattern + build bulk string
+    for key in guard.keys() {
+        if glob(pattern.as_bytes(), key.as_bytes()) {
+            matching.push(&key);
+            bulk_str.push_str(&format!("${}\r\n{key}\r\n", key.len()));
+        }
+    }
+
+    // Emit final bulk string
+    bulk_str = format!("*{}\r\n{bulk_str}", matching.len());
+    client.tx.send(bulk_str.into_bytes()).unwrap();
 }
 
 fn cmd_other(cmd_name: &String, args: &[String], client: &Client) {
@@ -1353,6 +1456,8 @@ impl Command {
             "REPLCONF" => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
             "PSYNC"    => cmd_psync(&client, repl_state.clone()).await,
             "WAIT"     => cmd_wait(args, &client, repl_state.clone()).await,
+            "CONFIG"   => grp_config(args, &client, config.clone()),
+            "KEYS"     => cmd_keys(args, &client, db).await,
             _          => cmd_other(&self.name, args, &client)
         }
 
