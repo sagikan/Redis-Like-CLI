@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::error::Error;
 use std::path::Path;
 use std::fs::{File, create_dir_all, write};

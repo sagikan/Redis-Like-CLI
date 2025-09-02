@@ -129,14 +129,6 @@ async fn get_last_seq_entry(db: Database, stream_key: &String,
     None
 }
 
-fn gen_ms() -> usize {
-    // Return the current UNIX time in ms
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(t) => t.as_millis() as usize,
-        _ => panic!("You're a time traveller, Harry!")
-    }
-}
-
 async fn gen_seq(db: Database, stream_key: &String, ms_time: usize) -> usize {
     match get_last_entry(db.clone(), &stream_key).await {
         Some(last_entry) => {
@@ -148,6 +140,18 @@ async fn gen_seq(db: Database, stream_key: &String, ms_time: usize) -> usize {
         },
         None if ms_time > 0 => 0,
         None => 1 // ms_time = 0
+    }
+}
+
+fn get_unix_time(in_ms: bool) -> usize {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("You're a time traveller, Harry!");
+
+    if in_ms { // Milliseconds
+        now.as_millis() as usize
+    } else { // Seconds
+        now.as_secs() as usize
     }
 }
 
@@ -244,8 +248,8 @@ async fn cmd_set(to_send: bool, args: &[String], client: &Client, db: Database) 
                     let value = Value {
                         val: ValueType::String(args[1].clone()),
                         exp: Some(match arg {
-                            "EX" => ExpiryType::Seconds(timeout),
-                            "PX" => ExpiryType::Milliseconds(timeout),
+                            "EX" => ExpiryType::Seconds(get_unix_time(false) + timeout),
+                            "PX" => ExpiryType::Milliseconds(get_unix_time(true) + timeout),
                             _ => unreachable!()
                         })
                     };
@@ -269,18 +273,43 @@ async fn cmd_get(args: &[String], client: &Client, db: Database) {
         return;
     }
 
+    let key = &args[0];
+
     // Extract + emit value
-    let val = match db.lock().await.get(&args[0]) {
-        Some(value) => match &value.val {
-            ValueType::String(val) => val.clone(),
-            _ => { panic!("Extraction Error"); }
+    let mut guard = db.lock().await;
+    let val = match guard.get(key) {
+        Some(value) => {
+            let mut expired = false;
+            // Check expiry
+            if let Some(exp) = &value.exp {
+                // Get current UNIX time + expiry time
+                let (now, exp) = match exp {
+                    ExpiryType::Milliseconds(exp) => (get_unix_time(true), *exp),
+                    ExpiryType::Seconds(exp) => (get_unix_time(false), *exp)
+                };
+
+                expired = now > exp;
+            }
+
+            if !expired {
+                match &value.val {
+                    ValueType::String(val) => Some(val),
+                    _ => { panic!("Extraction Error"); }
+                }
+            } else { None }
         }, None => {
             client.tx.send(Response::Nil.into()).unwrap();
             return;
         }
     };
 
-    client.tx.send(format!("+{val}\r\n").into_bytes()).unwrap();
+    if val.is_none() { // Expired value
+        guard.remove(key); // Remove entry
+        client.tx.send(Response::Nil.into()).unwrap();
+        return;
+    }
+
+    client.tx.send(format!("+{}\r\n", val.unwrap()).into_bytes()).unwrap();
 }
 
 async fn cmd_push(from_right: bool, to_send: bool, args: &[String],
@@ -629,7 +658,7 @@ async fn cmd_xadd(to_send: bool, args: &[String], client: &Client, db: Database,
         db.clone(), &stream_key, &args[1], &client
     ).await {
         Some(EntryIdType::Full(_)) => {
-            let ms = gen_ms();
+            let ms = get_unix_time(true); // Current UNIX time in ms
             let seq = gen_seq(db.clone(), &stream_key, ms).await;
             (ms, seq)
         }, Some(EntryIdType::Partial(ms)) => {

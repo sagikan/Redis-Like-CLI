@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::error::Error;
 use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
