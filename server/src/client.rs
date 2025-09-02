@@ -15,6 +15,7 @@ pub struct Client_ {
     pub id: usize,
     pub tx: UnboundedSender<Vec<u8>>,
     pub in_transaction: Option<Arc<Mutex<bool>>>,
+    pub in_sub_mode: Option<Arc<Mutex<bool>>>,
     pub queued_commands: Option<Arc<Mutex<Vec<Command>>>>,
     pub subs: Option<Arc<Mutex<Vec<String>>>>
 }
@@ -28,28 +29,29 @@ impl Client_ {
 
     pub async fn in_transaction(&self) -> bool {
         match &self.in_transaction {
-            Some(in_t) => *in_t.lock().await,
+            Some(in_tr) => *in_tr.lock().await,
             None => false
         }
     }
 
     pub async fn set_transaction(&self, v: bool) {
         match &self.in_transaction {
-            Some(in_t) => { *in_t.lock().await = v; },
+            Some(in_tr) => { *in_tr.lock().await = v; },
             None => ()
         }
     }
 
-    pub async fn drain_queued(&self) -> Option<Vec<Command>> {
-        match &self.queued_commands {
-            Some(q_cmds) => Some(q_cmds.lock().await.drain(..).collect()),
-            None => None
+    pub async fn in_sub_mode(&self) -> bool {
+        match &self.in_sub_mode {
+            Some(in_sub) => *in_sub.lock().await,
+            None => false
         }
     }
 
-    pub async fn push_queued(&self, cmd: Command) {
-        if let Some(queued) = &self.queued_commands {
-            queued.lock().await.push(cmd);
+    pub async fn set_sub_mode(&self, v: bool) {
+        match &self.in_sub_mode {
+            Some(in_sub) => { *in_sub.lock().await = v; },
+            None => ()
         }
     }
 
@@ -64,6 +66,19 @@ impl Client_ {
         }
 
         new_count
+    }
+
+    pub async fn drain_queued(&self) -> Option<Vec<Command>> {
+        match &self.queued_commands {
+            Some(q_cmds) => Some(q_cmds.lock().await.drain(..).collect()),
+            None => None
+        }
+    }
+
+    pub async fn push_queued(&self, cmd: Command) {
+        if let Some(queued) = &self.queued_commands {
+            queued.lock().await.push(cmd);
+        }
     }
 }
 
@@ -89,6 +104,7 @@ pub enum Response {
     Ok,
     Ping,
     Pong,
+    SubPong,
     Queued,
     ErrEmptyCommand,
     ErrArgCount,
@@ -115,6 +131,7 @@ impl From<Response> for Vec<u8> {
             Response::Ok => &b"+OK\r\n"[..],
             Response::Ping => &b"*1\r\n$4\r\nPING\r\n"[..],
             Response::Pong => &b"+PONG\r\n"[..],
+            Response::SubPong => &b"*2\r\n$4\r\npong\r\n$0\r\n\r\n"[..],
             Response::Queued => &b"+QUEUED\r\n"[..],
             Response::ErrEmptyCommand => &b"-ERR unknown command ''\r\n"[..],
             Response::ErrArgCount => &b"-ERR wrong number of arguments for command\r\n"[..],

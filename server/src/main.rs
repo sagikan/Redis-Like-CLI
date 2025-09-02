@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc::unbounded_channel, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use crate::db::{Database, BlockedClients};
+use crate::db::{Database, BlockedClients, Subscriptions};
 use crate::config::{Config, Config_, ReplState};
 use crate::client::{get_next_id, Client_, Client, Response};
 use crate::commands::Command;
@@ -171,8 +171,8 @@ async fn process_rdb(
 }
 
 async fn process_cmd(
-    cmd: &[u8], is_propagated: bool, client: &Client, config: Config,
-    repl_state: ReplState, db: Database, blocked_clients: BlockedClients
+    cmd: &[u8], is_propagated: bool, client: &Client, config: Config, repl_state: ReplState,
+     db: Database, blocked_clients: BlockedClients, subs: Subscriptions
 ) {
     let mut cmd: Command = match Command::from(cmd, is_propagated) {
         Some(cmd) => cmd,
@@ -182,12 +182,12 @@ async fn process_cmd(
         }
     };
 
-    cmd.execute(&client, config, repl_state, db, blocked_clients).await; 
+    cmd.execute(&client, config, repl_state, db, blocked_clients, subs).await; 
 }
 
 async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client,
                            config: Config, repl_state: ReplState, db: Database,
-                           blocked_clients: BlockedClients) {
+                           blocked_clients: BlockedClients, subs: Subscriptions) {
     let mut cmd_start = start;
 
     while cmd_start < end {
@@ -201,7 +201,7 @@ async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client
         let cmd = &buf[cmd_start..cmd_start+cmd_len];
         process_cmd(
             cmd, true, client, config.clone(), repl_state.clone(),
-            db.clone(), blocked_clients.clone()
+            db.clone(), blocked_clients.clone(), subs.clone()
         ).await;
 
         cmd_start += cmd_len;
@@ -209,7 +209,7 @@ async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client
 }
 
 async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState,
-                    db: Database, blocked_clients: BlockedClients) {
+                    db: Database, blocked_clients: BlockedClients, subs: Subscriptions) {
     loop {
         // Accept client
         let (socket, _) = listener.accept().await.unwrap();
@@ -219,6 +219,7 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
             id: get_next_id(),
             tx,
             in_transaction: Some(Arc::new(Mutex::new(false))),
+            in_sub_mode: Some(Arc::new(Mutex::new(false))),
             queued_commands: Some(Arc::new(Mutex::new(Vec::new()))),
             subs: Some(Arc::new(Mutex::new(Vec::new())))
         });
@@ -236,6 +237,7 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
         let tokio_repl_state = repl_state.clone();
         let tokio_db = db.clone();
         let tokio_blocked_clients = blocked_clients.clone();
+        let tokio_subs = subs.clone();
         tokio::spawn(async move {
             let mut buf = vec![0; BIG_BUFSIZE];
 
@@ -249,7 +251,8 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
                         tokio_config.clone(),
                         tokio_repl_state.clone(),
                         tokio_db.clone(),
-                        tokio_blocked_clients.clone()
+                        tokio_blocked_clients.clone(),
+                        tokio_subs.clone()
                     ).await, Err(e) => {
                         eprintln!("Error: {e}");
                         return;
@@ -260,14 +263,16 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
     }
 }
 
-fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config: Config,
-               repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
+fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>,
+               config: Config, repl_state: ReplState, db: Database,
+               blocked_clients: BlockedClients, subs: Subscriptions) {
     let (mut reader, mut writer) = master_stream.into_split();
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     let client = Arc::new(Client_ { // Dummy
         id: 0, 
         tx,
         in_transaction: None,
+        in_sub_mode: None,
         queued_commands: None,
         subs: None
     });
@@ -295,7 +300,8 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
                     config.clone(),
                     repl_state.clone(),
                     db.clone(),
-                    blocked_clients.clone()
+                    blocked_clients.clone(),
+                    subs.clone()
                 ).await;
             }
         }
@@ -312,7 +318,8 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
                     config.clone(),
                     repl_state.clone(),
                     db.clone(),
-                    blocked_clients.clone()
+                    blocked_clients.clone(),
+                    subs.clone()
                 ).await, Err(e) => {
                     eprintln!("Error: {e}");
                     return;
@@ -337,6 +344,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Database::from(RDBFile::from(&config.dir, &config.dbfilename)?).await?
     } else { Database::default() }; // (Updated during handshake)
     let blocked_clients = BlockedClients::default();
+    let subs = Subscriptions::default();
 
     // Set listener
     let listener = TcpListener::bind(format!(
@@ -348,9 +356,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let tokio_repl_state = repl_state.clone();
     let tokio_db = db.clone();
     let tokio_blocked_clients = blocked_clients.clone();
+    let tokio_subs = subs.clone();
     let server_handler = tokio::spawn(async move {
         run_server(
-            listener, tokio_config, tokio_repl_state, tokio_db, tokio_blocked_clients
+            listener, tokio_config, tokio_repl_state, tokio_db,
+            tokio_blocked_clients, tokio_subs
         ).await;
     });
 
@@ -363,7 +373,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             db.clone()
         ).await {
             Ok((stream, attached_data)) => run_replica(
-                stream, attached_data, config, repl_state, db, blocked_clients
+                stream, attached_data, config, repl_state, db, blocked_clients, subs
             ), Err(e) => {
                 eprintln!("Error: {e}");
             }

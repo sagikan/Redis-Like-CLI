@@ -198,6 +198,15 @@ fn glob(pattern: &[u8], key: &[u8]) -> bool {
     pat_i == pat_len
 }
 
+async fn cmd_ping(to_send: bool, client: &Client) {
+    let pong: Vec<u8> = match client.in_sub_mode().await {
+        true => Response::SubPong,
+        false => Response::Pong
+    }.into();
+
+    client.send_if(to_send, pong);
+}
+
 fn cmd_echo(args: &[String], client: &Client) {
     if let Some(_val) = args.get(0) {
         let to_write = format!("+{}\r\n", args[0..].join(" "));
@@ -1135,8 +1144,8 @@ async fn cmd_multi(to_send: bool, client: &Client) {
     client.send_if(to_send, Response::Ok);
 }
 
-async fn cmd_exec(to_send: bool, client: &Client, config: Config,
-                  repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
+async fn cmd_exec(to_send: bool, client: &Client, config: Config, repl_state: ReplState,
+                  db: Database, blocked_clients: BlockedClients, subs: Subscriptions) {
     if !client.in_transaction().await {
         client.send_if(to_send, Response::ErrExecWithoutMulti);
         return;
@@ -1152,7 +1161,8 @@ async fn cmd_exec(to_send: bool, client: &Client, config: Config,
     for mut cmd in queued {
         // Box::pin for recursion warning
         Box::pin(cmd.execute(
-            &client, config.clone(), repl_state.clone(), db.clone(), blocked_clients.clone()
+            &client, config.clone(), repl_state.clone(), db.clone(),
+            blocked_clients.clone(), subs.clone()
         )).await;
     }
 }
@@ -1376,21 +1386,61 @@ async fn cmd_keys(args: &[String], client: &Client, db: Database) {
     client.tx.send(bulk_str.into_bytes()).unwrap();
 }
 
-async fn cmd_subscribe(args: &[String], client: &Client) {
+async fn cmd_subscribe(args: &[String], client: &Client, subs: Subscriptions) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
 
     let channel = &args[0];
-    // Subscribe + get # of channels client is subbed to
+    // Enter sub mode
+    client.set_sub_mode(true).await;
+    // Subscribe (double-edged) + get # of channels client is subbed to
     let sub_count = client.sub(channel).await;
-
+    {
+        let mut subs_guard = subs.lock().await;
+        if let Some(sub_list) = subs_guard.get_mut(channel.as_str()) {
+            sub_list.push(client.clone());
+        } else {
+            // Create sub list
+            let mut new_list = Vec::new();
+            new_list.push(client.clone());
+            subs_guard.insert(channel.clone(), new_list);
+        }
+    }
+    
     // Emit array with sub info
     client.tx.send(format!(
         "*3\r\n$9\r\nsubscribe\r\n${}\r\n{channel}\r\n:{sub_count}\r\n",
         channel.len()
     ).into_bytes()).unwrap();
+}
+
+async fn cmd_publish(args: &[String], client: &Client, subs: Subscriptions) {
+    if args.len() != 2 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    // Extract channel + message (without ")
+    let channel = &args[0];
+    let msg = &args[1].trim_matches('"');
+
+    // Send message to all subs
+    let subs_guard = subs.lock().await;
+    let subs_list = match subs_guard.get(channel.as_str()) {
+        Some(list) => list,
+        None => &Vec::new()
+    };
+    for sub in subs_list {
+        sub.tx.send(format!(
+            "*3\r\n$7\r\nmessage\r\n${}\r\n{channel}\r\n${}\r\n{msg}\r\n",
+            channel.len(), msg.len()
+        ).into_bytes()).unwrap();
+    }
+
+    // Emit # of subs
+    client.tx.send(format!(":{}\r\n", subs_list.len()).into_bytes()).unwrap();
 }
 
 fn cmd_other(cmd_name: &String, args: &[String], client: &Client) {
@@ -1445,7 +1495,7 @@ impl Command {
 
     pub async fn execute(
         &mut self, client: &Client, config: Config, repl_state: ReplState,
-        db: Database, blocked_clients: BlockedClients
+        db: Database, blocked_clients: BlockedClients, subs: Subscriptions
     ) {
         if config.is_master && self.is_write() {
             // Propagate command to replicas
@@ -1459,12 +1509,17 @@ impl Command {
         
         let uc_name = self.name.to_uppercase();
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
-        
+        let sub_cmds = ["SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PING", "QUIT", "RESET"];
         // Queue non-EXEC/DISCARD command if in transaction mode
-        if client.in_transaction().await
-           && !transactional_cmds.contains(&uc_name.as_str()) {
+        if client.in_transaction().await && !transactional_cmds.contains(&uc_name.as_str()) {
             client.push_queued(self.clone()).await;
             client.tx.send(Response::Queued.into()).unwrap();
+            return;
+        } // Reject invalid commands if in subscribed mode
+        else if client.in_sub_mode().await && !sub_cmds.contains(&uc_name.as_str()) {
+            client.tx.send(format!(
+                "-ERR Can't execute '{uc_name}' in this context\r\n"
+            ).into_bytes()).unwrap();
             return;
         }
 
@@ -1473,7 +1528,7 @@ impl Command {
 
         // Handle command
         match uc_name.as_str() {
-            "PING"      => client.send_if(to_send, Response::Pong),
+            "PING"      => cmd_ping(to_send, &client).await,
             "ECHO"      => cmd_echo(args, &client),
             "SET"       => cmd_set(to_send, args, &client, db).await,
             "GET"       => cmd_get(args, &client, db).await,
@@ -1491,7 +1546,7 @@ impl Command {
             "XREAD"     => cmd_xread(args, &client, db, blocked_clients).await,
             "INCR"      => cmd_incr(to_send, args, &client, db).await,
             "MULTI"     => cmd_multi(to_send, &client).await,
-            "EXEC"      => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients).await,
+            "EXEC"      => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients, subs).await,
             "DISCARD"   => cmd_discard(to_send, &client).await,
             "INFO"      => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
             "REPLCONF"  => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
@@ -1499,7 +1554,8 @@ impl Command {
             "WAIT"      => cmd_wait(args, &client, repl_state.clone()).await,
             "CONFIG"    => grp_config(args, &client, config.clone()),
             "KEYS"      => cmd_keys(args, &client, db).await,
-            "SUBSCRIBE" => cmd_subscribe(args, &client).await,
+            "SUBSCRIBE" => cmd_subscribe(args, &client, subs).await,
+            "PUBLISH"   => cmd_publish(args, &client, subs).await,
             _           => cmd_other(&self.name, args, &client)
         }
 

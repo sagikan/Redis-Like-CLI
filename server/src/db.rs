@@ -3,7 +3,7 @@ use std::collections::{VecDeque, HashMap};
 use std::sync::Arc;
 use std::future::Future;
 use tokio::sync::{Mutex, MutexGuard};
-use crate::client::BlockedClient;
+use crate::client::{Client, BlockedClient};
 use crate::rdb::RDBFile;
 
 pub type Fields = Arc<HashMap<String, String>>;
@@ -11,6 +11,8 @@ pub type Fields = Arc<HashMap<String, String>>;
 pub type Entries = Arc<Mutex<VecDeque<Entry>>>;
 
 pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
+
+pub type Subscriptions = Arc<Mutex<HashMap<String, Vec<Client>>>>;
 
 #[derive(Clone)]
 pub struct Entry {
