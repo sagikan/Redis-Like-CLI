@@ -218,8 +218,9 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
         let client = Arc::new(Client_ {
             id: get_next_id(),
             tx,
-            in_transaction: Arc::new(Mutex::new(false)),
-            queued_commands: Arc::new(Mutex::new(Vec::new()))
+            in_transaction: Some(Arc::new(Mutex::new(false))),
+            queued_commands: Some(Arc::new(Mutex::new(Vec::new()))),
+            subs: Some(Arc::new(Mutex::new(Vec::new())))
         });
 
         // Tokio-runtime write task
@@ -263,11 +264,12 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, config:
                repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
     let (mut reader, mut writer) = master_stream.into_split();
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
-    let client = Arc::new(Client_ {
-        id: 0, // Dummy
+    let client = Arc::new(Client_ { // Dummy
+        id: 0, 
         tx,
-        in_transaction: Arc::new(Mutex::new(false)),
-        queued_commands: Arc::new(Mutex::new(Vec::new()))
+        in_transaction: None,
+        queued_commands: None,
+        subs: None
     });
 
     // Tokio-runtime write task (for ACKs)

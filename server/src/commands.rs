@@ -1126,32 +1126,30 @@ async fn cmd_incr(to_send: bool, args: &[String], client: &Client, db: Database)
 }
 
 async fn cmd_multi(to_send: bool, client: &Client) {
-    let mut in_transaction = client.in_transaction.lock().await;
-    if *in_transaction {
+    if client.in_transaction().await {
         client.send_if(to_send, Response::ErrNestedMulti);
         return;
     }
-    *in_transaction = true; // Start transaction
+    client.set_transaction(true).await; // Start transaction
 
     client.send_if(to_send, Response::Ok);
 }
 
 async fn cmd_exec(to_send: bool, client: &Client, config: Config,
                   repl_state: ReplState, db: Database, blocked_clients: BlockedClients) {
-    {
-        let mut in_transaction = client.in_transaction.lock().await;
-        if !*in_transaction {
-            client.send_if(to_send, Response::ErrExecWithoutMulti);
-            return;
-        }
-        *in_transaction = false; // End transaction
+    if !client.in_transaction().await {
+        client.send_if(to_send, Response::ErrExecWithoutMulti);
+        return;
     }
+    client.set_transaction(false).await; // End transaction
 
-    let queue: Vec<Command> = client.queued_commands.lock().await.drain(..).collect();
+    let queued: Vec<Command> = client
+        .drain_queued().await
+        .unwrap_or_else(Vec::new);
     // Emit array length
-    client.send_if(to_send, format!("*{}\r\n", queue.len()).into_bytes());
+    client.send_if(to_send, format!("*{}\r\n", queued.len()).into_bytes());
     // Execute queued commands
-    for mut cmd in queue {
+    for mut cmd in queued {
         // Box::pin for recursion warning
         Box::pin(cmd.execute(
             &client, config.clone(), repl_state.clone(), db.clone(), blocked_clients.clone()
@@ -1160,17 +1158,14 @@ async fn cmd_exec(to_send: bool, client: &Client, config: Config,
 }
 
 async fn cmd_discard(to_send: bool, client: &Client) {
-    {
-        let mut in_transaction = client.in_transaction.lock().await;
-        if !*in_transaction {
-            client.send_if(to_send, Response::ErrDiscardWithoutMulti);
-            return;
-        }
-        *in_transaction = false; // End transaction
+    if !client.in_transaction().await {
+        client.send_if(to_send, Response::ErrDiscardWithoutMulti);
+        return;
     }
+    client.set_transaction(false).await; // End transaction
 
     // Empty command queue
-    client.queued_commands.lock().await.clear();
+    client.drain_queued().await;
 
     client.send_if(to_send, Response::Ok);
 }
@@ -1381,6 +1376,23 @@ async fn cmd_keys(args: &[String], client: &Client, db: Database) {
     client.tx.send(bulk_str.into_bytes()).unwrap();
 }
 
+async fn cmd_subscribe(args: &[String], client: &Client) {
+    if args.len() != 1 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    let channel = &args[0];
+    // Subscribe + get # of channels client is subbed to
+    let sub_count = client.sub(channel).await;
+
+    // Emit array with sub info
+    client.tx.send(format!(
+        "*3\r\n$9\r\nsubscribe\r\n${}\r\n{channel}\r\n:{sub_count}\r\n",
+        channel.len()
+    ).into_bytes()).unwrap();
+}
+
 fn cmd_other(cmd_name: &String, args: &[String], client: &Client) {
     // Build + emit error string
     let mut err_str = format!("-ERR unknown command '{cmd_name}', with args beginning with: ");
@@ -1449,9 +1461,9 @@ impl Command {
         let transactional_cmds = ["MULTI", "EXEC", "DISCARD"];
         
         // Queue non-EXEC/DISCARD command if in transaction mode
-        if *client.in_transaction.lock().await
+        if client.in_transaction().await
            && !transactional_cmds.contains(&uc_name.as_str()) {
-            client.queued_commands.lock().await.push(self.clone());
+            client.push_queued(self.clone()).await;
             client.tx.send(Response::Queued.into()).unwrap();
             return;
         }
@@ -1461,33 +1473,34 @@ impl Command {
 
         // Handle command
         match uc_name.as_str() {
-            "PING"     => client.send_if(to_send, Response::Pong),
-            "ECHO"     => cmd_echo(args, &client),
-            "SET"      => cmd_set(to_send, args, &client, db).await,
-            "GET"      => cmd_get(args, &client, db).await,
-            "RPUSH"    => cmd_push(true, to_send, args, &client, db, blocked_clients).await,
-            "LPUSH"    => cmd_push(false, to_send, args, &client, db, blocked_clients).await,
-            "RPOP"     => cmd_pop(true, to_send, args, &client, db).await,
-            "LPOP"     => cmd_pop(false, to_send, args, &client, db).await,
-            "BRPOP"    => cmd_bpop(true, to_send, args, &client, db, blocked_clients).await,
-            "BLPOP"    => cmd_bpop(false, to_send, args, &client, db, blocked_clients).await,
-            "LRANGE"   => cmd_lrange(args, &client, db).await,
-            "LLEN"     => cmd_llen(args, &client, db).await,
-            "TYPE"     => cmd_type(args, &client, db).await,
-            "XADD"     => cmd_xadd(to_send, args, &client, db, blocked_clients).await,
-            "XRANGE"   => cmd_xrange(args, &client, db).await,
-            "XREAD"    => cmd_xread(args, &client, db, blocked_clients).await,
-            "INCR"     => cmd_incr(to_send, args, &client, db).await,
-            "MULTI"    => cmd_multi(to_send, &client).await,
-            "EXEC"     => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients).await,
-            "DISCARD"  => cmd_discard(to_send, &client).await,
-            "INFO"     => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
-            "REPLCONF" => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
-            "PSYNC"    => cmd_psync(&client, repl_state.clone()).await,
-            "WAIT"     => cmd_wait(args, &client, repl_state.clone()).await,
-            "CONFIG"   => grp_config(args, &client, config.clone()),
-            "KEYS"     => cmd_keys(args, &client, db).await,
-            _          => cmd_other(&self.name, args, &client)
+            "PING"      => client.send_if(to_send, Response::Pong),
+            "ECHO"      => cmd_echo(args, &client),
+            "SET"       => cmd_set(to_send, args, &client, db).await,
+            "GET"       => cmd_get(args, &client, db).await,
+            "RPUSH"     => cmd_push(true, to_send, args, &client, db, blocked_clients).await,
+            "LPUSH"     => cmd_push(false, to_send, args, &client, db, blocked_clients).await,
+            "RPOP"      => cmd_pop(true, to_send, args, &client, db).await,
+            "LPOP"      => cmd_pop(false, to_send, args, &client, db).await,
+            "BRPOP"     => cmd_bpop(true, to_send, args, &client, db, blocked_clients).await,
+            "BLPOP"     => cmd_bpop(false, to_send, args, &client, db, blocked_clients).await,
+            "LRANGE"    => cmd_lrange(args, &client, db).await,
+            "LLEN"      => cmd_llen(args, &client, db).await,
+            "TYPE"      => cmd_type(args, &client, db).await,
+            "XADD"      => cmd_xadd(to_send, args, &client, db, blocked_clients).await,
+            "XRANGE"    => cmd_xrange(args, &client, db).await,
+            "XREAD"     => cmd_xread(args, &client, db, blocked_clients).await,
+            "INCR"      => cmd_incr(to_send, args, &client, db).await,
+            "MULTI"     => cmd_multi(to_send, &client).await,
+            "EXEC"      => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients).await,
+            "DISCARD"   => cmd_discard(to_send, &client).await,
+            "INFO"      => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
+            "REPLCONF"  => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
+            "PSYNC"     => cmd_psync(&client, repl_state.clone()).await,
+            "WAIT"      => cmd_wait(args, &client, repl_state.clone()).await,
+            "CONFIG"    => grp_config(args, &client, config.clone()),
+            "KEYS"      => cmd_keys(args, &client, db).await,
+            "SUBSCRIBE" => cmd_subscribe(args, &client).await,
+            _           => cmd_other(&self.name, args, &client)
         }
 
         let mut state_guard = repl_state.lock().await;

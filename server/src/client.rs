@@ -14,8 +14,9 @@ pub fn get_next_id() -> usize {
 pub struct Client_ {
     pub id: usize,
     pub tx: UnboundedSender<Vec<u8>>,
-    pub in_transaction: Arc<Mutex<bool>>,
-    pub queued_commands: Arc<Mutex<Vec<Command>>>
+    pub in_transaction: Option<Arc<Mutex<bool>>>,
+    pub queued_commands: Option<Arc<Mutex<Vec<Command>>>>,
+    pub subs: Option<Arc<Mutex<Vec<String>>>>
 }
 
 impl Client_ {
@@ -23,6 +24,46 @@ impl Client_ {
         if to_send {
             self.tx.send(msg.into()).unwrap();
         }
+    }
+
+    pub async fn in_transaction(&self) -> bool {
+        match &self.in_transaction {
+            Some(in_t) => *in_t.lock().await,
+            None => false
+        }
+    }
+
+    pub async fn set_transaction(&self, v: bool) {
+        match &self.in_transaction {
+            Some(in_t) => { *in_t.lock().await = v; },
+            None => ()
+        }
+    }
+
+    pub async fn drain_queued(&self) -> Option<Vec<Command>> {
+        match &self.queued_commands {
+            Some(q_cmds) => Some(q_cmds.lock().await.drain(..).collect()),
+            None => None
+        }
+    }
+
+    pub async fn push_queued(&self, cmd: Command) {
+        if let Some(queued) = &self.queued_commands {
+            queued.lock().await.push(cmd);
+        }
+    }
+
+    pub async fn sub(&self, channel: &String) -> usize {
+        let mut new_count = 0;
+
+        if let Some(subs) = &self.subs {
+            let mut subs_guard = subs.lock().await;
+            // Insert channel + get new count
+            subs_guard.push(channel.clone());
+            new_count = subs_guard.len();
+        }
+
+        new_count
     }
 }
 
