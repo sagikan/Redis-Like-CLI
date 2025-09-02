@@ -426,7 +426,7 @@ async fn cmd_pop(from_right: bool, to_send: bool, args: &[String],
     }
 
     let key = &args[0];
-    // Get number of pops based on args length
+    // Get # of pops based on args length
     let pop_num = match args_len {
         1 => 1,
         2 => match args[1].parse::<usize>() {
@@ -442,7 +442,7 @@ async fn cmd_pop(from_right: bool, to_send: bool, args: &[String],
     match guard.get_mut(key) {
         Some(value) => match &mut value.val {
             ValueType::StringList(val_list) => { // An existing list is found
-                // Clamp number of pops and set L/R functionality
+                // Clamp # of pops and set L/R functionality
                 let val_list_len = val_list.len();
                 let pop_num_usize: usize = min(pop_num as usize, val_list_len);
                 let mut my_pop = || if from_right { val_list.pop_back() }
@@ -1274,7 +1274,7 @@ async fn cmd_wait(args: &[String], client: &Client, repl_state: ReplState) {
     }
 
     let last_write = { repl_state.lock().await.repl_offset };
-    // Handle by number of replicas + timeout
+    // Handle by # of replicas + timeout
     let acknowledged = match (args[0].parse::<usize>(), args[1].parse::<usize>()) {
         (Ok(0), Ok(_)) => { // Immediate
             let state_guard = repl_state.lock().await;
@@ -1324,7 +1324,7 @@ async fn cmd_wait(args: &[String], client: &Client, repl_state: ReplState) {
         }
     };
 
-    // Emit number of up-to-last-write replicas
+    // Emit # of up-to-last-write replicas
     client.tx.send(format!(":{acknowledged}\r\n").into_bytes()).unwrap();
 }
 
@@ -1395,7 +1395,7 @@ async fn cmd_subscribe(args: &[String], client: &Client, subs: Subscriptions) {
     let channel = &args[0];
     // Enter sub mode
     client.set_sub_mode(true).await;
-    // Subscribe (double-edged) + get # of channels client is subbed to
+    // Subscribe (double-edged) + get updated # of channels client is subbed to
     let sub_count = client.sub(channel).await;
     {
         let mut subs_guard = subs.lock().await;
@@ -1412,6 +1412,29 @@ async fn cmd_subscribe(args: &[String], client: &Client, subs: Subscriptions) {
     // Emit array with sub info
     client.tx.send(format!(
         "*3\r\n$9\r\nsubscribe\r\n${}\r\n{channel}\r\n:{sub_count}\r\n",
+        channel.len()
+    ).into_bytes()).unwrap();
+}
+
+async fn cmd_unsubscribe(args: &[String], client: &Client, subs: Subscriptions) {
+    if args.len() != 1 {
+        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        return;
+    }
+
+    let channel = &args[0];
+    // Unsubscribe (double-edged) + get updated # of channels client is subbed to
+    let sub_count = client.unsub(channel).await;
+    {
+        let mut subs_guard = subs.lock().await;
+        if let Some(sub_list) = subs_guard.get_mut(channel.as_str()) {
+            sub_list.retain(|c| c.id != client.id);
+        }
+    }
+
+    // Emit array with unsub info
+    client.tx.send(format!(
+        "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{channel}\r\n:{sub_count}\r\n",
         channel.len()
     ).into_bytes()).unwrap();
 }
@@ -1528,35 +1551,36 @@ impl Command {
 
         // Handle command
         match uc_name.as_str() {
-            "PING"      => cmd_ping(to_send, &client).await,
-            "ECHO"      => cmd_echo(args, &client),
-            "SET"       => cmd_set(to_send, args, &client, db).await,
-            "GET"       => cmd_get(args, &client, db).await,
-            "RPUSH"     => cmd_push(true, to_send, args, &client, db, blocked_clients).await,
-            "LPUSH"     => cmd_push(false, to_send, args, &client, db, blocked_clients).await,
-            "RPOP"      => cmd_pop(true, to_send, args, &client, db).await,
-            "LPOP"      => cmd_pop(false, to_send, args, &client, db).await,
-            "BRPOP"     => cmd_bpop(true, to_send, args, &client, db, blocked_clients).await,
-            "BLPOP"     => cmd_bpop(false, to_send, args, &client, db, blocked_clients).await,
-            "LRANGE"    => cmd_lrange(args, &client, db).await,
-            "LLEN"      => cmd_llen(args, &client, db).await,
-            "TYPE"      => cmd_type(args, &client, db).await,
-            "XADD"      => cmd_xadd(to_send, args, &client, db, blocked_clients).await,
-            "XRANGE"    => cmd_xrange(args, &client, db).await,
-            "XREAD"     => cmd_xread(args, &client, db, blocked_clients).await,
-            "INCR"      => cmd_incr(to_send, args, &client, db).await,
-            "MULTI"     => cmd_multi(to_send, &client).await,
-            "EXEC"      => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients, subs).await,
-            "DISCARD"   => cmd_discard(to_send, &client).await,
-            "INFO"      => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
-            "REPLCONF"  => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
-            "PSYNC"     => cmd_psync(&client, repl_state.clone()).await,
-            "WAIT"      => cmd_wait(args, &client, repl_state.clone()).await,
-            "CONFIG"    => grp_config(args, &client, config.clone()),
-            "KEYS"      => cmd_keys(args, &client, db).await,
-            "SUBSCRIBE" => cmd_subscribe(args, &client, subs).await,
-            "PUBLISH"   => cmd_publish(args, &client, subs).await,
-            _           => cmd_other(&self.name, args, &client)
+            "PING"        => cmd_ping(to_send, &client).await,
+            "ECHO"        => cmd_echo(args, &client),
+            "SET"         => cmd_set(to_send, args, &client, db).await,
+            "GET"         => cmd_get(args, &client, db).await,
+            "RPUSH"       => cmd_push(true, to_send, args, &client, db, blocked_clients).await,
+            "LPUSH"       => cmd_push(false, to_send, args, &client, db, blocked_clients).await,
+            "RPOP"        => cmd_pop(true, to_send, args, &client, db).await,
+            "LPOP"        => cmd_pop(false, to_send, args, &client, db).await,
+            "BRPOP"       => cmd_bpop(true, to_send, args, &client, db, blocked_clients).await,
+            "BLPOP"       => cmd_bpop(false, to_send, args, &client, db, blocked_clients).await,
+            "LRANGE"      => cmd_lrange(args, &client, db).await,
+            "LLEN"        => cmd_llen(args, &client, db).await,
+            "TYPE"        => cmd_type(args, &client, db).await,
+            "XADD"        => cmd_xadd(to_send, args, &client, db, blocked_clients).await,
+            "XRANGE"      => cmd_xrange(args, &client, db).await,
+            "XREAD"       => cmd_xread(args, &client, db, blocked_clients).await,
+            "INCR"        => cmd_incr(to_send, args, &client, db).await,
+            "MULTI"       => cmd_multi(to_send, &client).await,
+            "EXEC"        => cmd_exec(to_send, &client, config.clone(), repl_state.clone(), db, blocked_clients, subs).await,
+            "DISCARD"     => cmd_discard(to_send, &client).await,
+            "INFO"        => cmd_info(args, &client, config.clone(), repl_state.clone()).await,
+            "REPLCONF"    => cmd_replconf(args, &client, config.clone(), repl_state.clone()).await,
+            "PSYNC"       => cmd_psync(&client, repl_state.clone()).await,
+            "WAIT"        => cmd_wait(args, &client, repl_state.clone()).await,
+            "CONFIG"      => grp_config(args, &client, config.clone()),
+            "KEYS"        => cmd_keys(args, &client, db).await,
+            "SUBSCRIBE"   => cmd_subscribe(args, &client, subs).await,
+            "UNSUBSCRIBE" => cmd_unsubscribe(args, &client, subs).await,
+            "PUBLISH"     => cmd_publish(args, &client, subs).await,
+            _             => cmd_other(&self.name, args, &client)
         }
 
         let mut state_guard = repl_state.lock().await;

@@ -56,16 +56,29 @@ impl Client_ {
     }
 
     pub async fn sub(&self, channel: &String) -> usize {
-        let mut new_count = 0;
+        let mut upd_count = 0;
 
         if let Some(subs) = &self.subs {
             let mut subs_guard = subs.lock().await;
-            // Insert channel + get new count
+            // Insert channel + get updated count
             subs_guard.push(channel.clone());
-            new_count = subs_guard.len();
+            upd_count = subs_guard.len();
         }
 
-        new_count
+        upd_count
+    }
+
+    pub async fn unsub(&self, channel: &String) -> usize {
+        let mut upd_count = 0;
+
+        if let Some(subs) = &self.subs {
+            let mut subs_guard = subs.lock().await;
+            // Remove channel + get updated count
+            subs_guard.retain(|c| c != channel);
+            upd_count = subs_guard.len();
+        }
+
+        upd_count
     }
 
     pub async fn drain_queued(&self) -> Option<Vec<Command>> {
