@@ -1,21 +1,19 @@
 mod db;
 mod config;
-mod client;
-mod commands;
+mod bundle;
 mod rdb;
+mod client;
+#[path = "commands/__command__.rs"]
+mod commands;
 
-use std::env;
-use std::str;
-use std::error::Error;
-use std::sync::Arc;
-use tokio::sync::{mpsc::unbounded_channel, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use crate::db::{Database, BlockedClients, Subscriptions};
-use crate::config::{Config, Config_, ReplState};
+use std::{env, str, error::Error, sync::Arc};
+use tokio::{sync::{mpsc::unbounded_channel, Mutex}, io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use crate::db::Database;
+use crate::config::{Config, ReplState};
+use crate::bundle::Bundle;
+use crate::rdb::RDBFile;
 use crate::client::{get_next_id, Client_, Client, Response};
 use crate::commands::Command;
-use crate::rdb::RDBFile;
 
 static SML_BUFSIZE: usize = 256;
 static BIG_BUFSIZE: usize = 1024;
@@ -171,9 +169,9 @@ async fn process_rdb(
 }
 
 async fn process_cmd(
-    cmd: &[u8], is_propagated: bool, client: &Client, config: Config, repl_state: ReplState,
-     db: Database, blocked_clients: BlockedClients, subs: Subscriptions
+    cmd: &[u8], is_propagated: bool, client: &Client, bundle: Bundle
 ) {
+    // Parse
     let mut cmd: Command = match Command::from(cmd, is_propagated) {
         Some(cmd) => cmd,
         None => { // Empty command
@@ -182,12 +180,10 @@ async fn process_cmd(
         }
     };
 
-    cmd.execute(&client, config, repl_state, db, blocked_clients, subs).await; 
+    cmd.execute(&client, bundle).await; 
 }
 
-async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client,
-                           config: Config, repl_state: ReplState, db: Database,
-                           blocked_clients: BlockedClients, subs: Subscriptions) {
+async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client, bundle: Bundle) {
     let mut cmd_start = start;
 
     while cmd_start < end {
@@ -199,17 +195,13 @@ async fn process_cmd_block(start: usize, end: usize, buf: &[u8], client: &Client
         };
 
         let cmd = &buf[cmd_start..cmd_start+cmd_len];
-        process_cmd(
-            cmd, true, client, config.clone(), repl_state.clone(),
-            db.clone(), blocked_clients.clone(), subs.clone()
-        ).await;
+        process_cmd(cmd, true, client, bundle.clone()).await;
 
         cmd_start += cmd_len;
     }
 }
 
-async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState,
-                    db: Database, blocked_clients: BlockedClients, subs: Subscriptions) {
+async fn run_server(listener: TcpListener, bundle: Bundle) {
     loop {
         // Accept client
         let (socket, _) = listener.accept().await.unwrap();
@@ -233,27 +225,15 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
         });
 
         // Tokio-runtime read task
-        let tokio_config = config.clone();
-        let tokio_repl_state = repl_state.clone();
-        let tokio_db = db.clone();
-        let tokio_blocked_clients = blocked_clients.clone();
-        let tokio_subs = subs.clone();
+        let tokio_bundle = bundle.clone();
         tokio::spawn(async move {
             let mut buf = vec![0; BIG_BUFSIZE];
 
             loop {
                 match reader.read(&mut buf).await {
                     Ok(0) => return, // Connection closed
-                    Ok(n) => process_cmd(
-                        &buf[..n],
-                        false, // Not propagated
-                        &client,
-                        tokio_config.clone(),
-                        tokio_repl_state.clone(),
-                        tokio_db.clone(),
-                        tokio_blocked_clients.clone(),
-                        tokio_subs.clone()
-                    ).await, Err(e) => {
+                    Ok(n) => process_cmd(&buf[..n], false, &client, tokio_bundle.clone()).await,
+                    Err(e) => {
                         eprintln!("Error: {e}");
                         return;
                     }
@@ -263,13 +243,11 @@ async fn run_server(listener: TcpListener, config: Config, repl_state: ReplState
     }
 }
 
-fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>,
-               config: Config, repl_state: ReplState, db: Database,
-               blocked_clients: BlockedClients, subs: Subscriptions) {
+fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>, bundle: Bundle) {
     let (mut reader, mut writer) = master_stream.into_split();
     let (tx, mut rx) = unbounded_channel::<Vec<u8>>();
     let client = Arc::new(Client_ { // Dummy
-        id: 0, 
+        id: 0,
         tx,
         in_transaction: None,
         in_sub_mode: None,
@@ -293,15 +271,8 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>,
         if let Some(cmd_block) = attached_data {
             if let Some(star) = cmd_block.iter().position(|&c| c == b'*') {
                 process_cmd_block(
-                    star, // Start
-                    cmd_block.len(), // End
-                    &cmd_block,
-                    &client,
-                    config.clone(),
-                    repl_state.clone(),
-                    db.clone(),
-                    blocked_clients.clone(),
-                    subs.clone()
+                    star, cmd_block.len(), // Start + End
+                    &cmd_block, &client, bundle.clone()
                 ).await;
             }
         }
@@ -311,15 +282,8 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>,
             match reader.read(&mut buf).await {
                 Ok(0) => return, // Connection closed
                 Ok(n) => process_cmd_block(
-                    0, // Start
-                    n, // End
-                    &buf,
-                    &client,
-                    config.clone(),
-                    repl_state.clone(),
-                    db.clone(),
-                    blocked_clients.clone(),
-                    subs.clone()
+                    0, n, // Start + End
+                    &buf, &client, bundle.clone()
                 ).await, Err(e) => {
                     eprintln!("Error: {e}");
                     return;
@@ -332,54 +296,35 @@ fn run_replica(master_stream: TcpStream, attached_data: Option<Vec<u8>>,
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Set server configuration + DBs
-    let config = Arc::new(Config_::from(env::args().skip(1).collect()));
-    let repl_state = if config.is_master {
-        let repl_state = ReplState::default();
-        // Initialize replica list
-        repl_state.lock().await.replicas = Some(Vec::new());
-
-        repl_state
-    } else { ReplState::default() }; // (Updated during handshake)
-    let db = if config.is_master {
-        Database::from(RDBFile::from(&config.dir, &config.dbfilename)?).await?
-    } else { Database::default() }; // (Updated during handshake)
-    let blocked_clients = BlockedClients::default();
-    let subs = Subscriptions::default();
+    let bundle = Bundle::from(env::args()).await?;
 
     // Set listener
     let listener = TcpListener::bind(format!(
-        "{}:{}", config.bind_addr, config.port
+        "{}:{}", bundle.config.bind_addr, bundle.config.port
     )).await?;
 
     // Run server-side
-    let tokio_config = config.clone();
-    let tokio_repl_state = repl_state.clone();
-    let tokio_db = db.clone();
-    let tokio_blocked_clients = blocked_clients.clone();
-    let tokio_subs = subs.clone();
+    let tokio_bundle = bundle.clone();
     let server_handler = tokio::spawn(async move {
-        run_server(
-            listener, tokio_config, tokio_repl_state, tokio_db,
-            tokio_blocked_clients, tokio_subs
-        ).await;
+        run_server(listener, tokio_bundle).await;
     });
 
     // Run replica-side
-    if !config.is_master {
+    if !bundle.config.is_master {
         // Initiate handshake with master
         match send_handshake(
-            config.clone(),
-            repl_state.clone(),
-            db.clone()
+            bundle.config.clone(),
+            bundle.repl_state.clone(),
+            bundle.db.clone()
         ).await {
-            Ok((stream, attached_data)) => run_replica(
-                stream, attached_data, config, repl_state, db, blocked_clients, subs
-            ), Err(e) => {
+            Ok((stream, attached_data)) => run_replica(stream, attached_data, bundle),
+            Err(e) => {
                 eprintln!("Error: {e}");
             }
         }
     }
 
     server_handler.await?; // Keep-Alive
+    
     unreachable!()
 }

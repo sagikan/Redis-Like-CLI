@@ -1,7 +1,4 @@
-use std::error::Error;
-use std::path::Path;
-use std::fs::{File, create_dir_all, write};
-use std::io::prelude::*;
+use std::{error::Error, path::Path, fs::{File, create_dir_all, write}, io::prelude::*};
 use crc64::crc64;
 use crate::db::{Database, Value, ValueType, ExpiryType, ExpiryLen};
 use crate::config::{DEF_DB_DIR, DEF_DB_FILE};
@@ -39,7 +36,7 @@ fn try_int_encode(to_encode: &str) -> Option<Vec<u8>> {
     Some(encoded)
 }
 
-fn usize_encode(to_encode: usize, num_bytes: Option<usize>) -> Vec<u8> {
+fn _usize_encode(to_encode: usize, num_bytes: Option<usize>) -> Vec<u8> {
     let encoded = to_encode.to_le_bytes(); // LE
     encoded.into_iter().take(num_bytes.unwrap_or(usize::MAX)).collect()
 }
@@ -252,7 +249,7 @@ impl RDBFile {
         metadata
     }
 
-    pub async fn gen_database(&mut self, dbs: Option<Vec<Database>>) {
+    pub async fn _gen_database(&mut self, dbs: Option<Vec<Database>>) {
         let mut database = vec![0xFE];
 
         if dbs.is_some() {
@@ -268,10 +265,10 @@ impl RDBFile {
                         match exp {
                             ExpiryType::Milliseconds(millis) => {
                                 database.push(0xFC); // Divider
-                                database.extend_from_slice(&usize_encode(*millis, Some(8)));
+                                database.extend_from_slice(&_usize_encode(*millis, Some(8)));
                             }, ExpiryType::Seconds(secs) => {
                                 database.push(0xFD); // Divider
-                                database.extend_from_slice(&usize_encode(*secs, Some(4)));
+                                database.extend_from_slice(&_usize_encode(*secs, Some(4)));
                             }
                         }
                     }
@@ -285,7 +282,7 @@ impl RDBFile {
                     }
                 }
             }
-        }
+        } else { database.push(0x00); }
 
         self.sect_database = database;
     }

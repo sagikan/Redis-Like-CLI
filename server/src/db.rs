@@ -1,66 +1,12 @@
-use std::error::Error;
-use std::collections::{VecDeque, HashMap};
-use std::sync::Arc;
-use std::future::Future;
+use std::{collections::{VecDeque, HashMap}, error::Error, sync::Arc, future::Future};
 use tokio::sync::{Mutex, MutexGuard};
 use crate::client::{Client, BlockedClient};
 use crate::rdb::RDBFile;
 
 pub type Fields = Arc<HashMap<String, String>>;
-
 pub type Entries = Arc<Mutex<VecDeque<Entry>>>;
-
 pub type BlockedClients = Arc<Mutex<HashMap<String, VecDeque<BlockedClient>>>>;
-
 pub type Subscriptions = Arc<Mutex<HashMap<String, Vec<Client>>>>;
-
-#[derive(Clone)]
-pub struct Entry {
-    pub ms_time: usize,
-    pub seq_num: usize,
-    pub fields: Fields
-}
-
-#[derive(Clone)]
-pub enum EntryIdType {
-    Full(()),
-    Partial(usize),
-    Explicit((usize, usize))
-}
-
-#[derive(Clone)]
-pub struct Stream {
-    pub entries: Entries
-}
-
-#[derive(Clone)]
-pub struct Value {
-    pub val: ValueType,
-    pub exp: Option<ExpiryType>
-}
-
-#[derive(Clone)]
-pub enum ValueType {
-    String(String),
-    StringList(VecDeque<String>),
-    Stream(Stream)
-}
-
-#[derive(Clone)]
-pub enum ExpiryType {
-    Milliseconds(usize),
-    Seconds(usize)
-}
-
-pub trait ExpiryLen {
-    fn elen(&self) -> usize;
-}
-
-impl ExpiryLen for HashMap<String, Value> {
-    fn elen(&self) -> usize {
-        self.values().filter(|val| val.exp.is_some()).count()
-    }
-}
 
 #[derive(Clone)]
 pub struct Database(pub Arc<Mutex<HashMap<String, Value>>>);
@@ -102,5 +48,54 @@ impl Database {
 
     pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, HashMap<String, Value>>> {
         self.0.lock()
+    }
+}
+
+#[derive(Clone)]
+pub struct Entry {
+    pub ms_time: usize,
+    pub seq_num: usize,
+    pub fields: Fields
+}
+
+#[derive(Clone)]
+pub enum EntryIdType {
+    Full(()),
+    Partial(usize),
+    Explicit((usize, usize))
+}
+
+#[derive(Clone)]
+pub struct Stream {
+    pub entries: Entries
+}
+
+#[derive(Clone)]
+pub struct Value {
+    pub val: ValueType,
+    pub exp: Option<ExpiryType>
+}
+
+#[derive(Clone)]
+pub enum ValueType {
+    String(String),
+    StringList(VecDeque<String>),
+    Stream(Stream)
+}
+
+#[derive(Clone)]
+pub enum ExpiryType {
+    Milliseconds(usize),
+    Seconds(usize)
+}
+
+#[allow(dead_code)]
+pub trait ExpiryLen {
+    fn elen(&self) -> usize;
+}
+
+impl ExpiryLen for HashMap<String, Value> {
+    fn elen(&self) -> usize {
+        self.values().filter(|val| val.exp.is_some()).count()
     }
 }

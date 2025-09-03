@@ -81,16 +81,16 @@ impl Client_ {
         upd_count
     }
 
+    pub async fn push_queued(&self, cmd: Command) {
+        if let Some(queued) = &self.queued_commands {
+            queued.lock().await.push(cmd);
+        }
+    }
+
     pub async fn drain_queued(&self) -> Option<Vec<Command>> {
         match &self.queued_commands {
             Some(q_cmds) => Some(q_cmds.lock().await.drain(..).collect()),
             None => None
-        }
-    }
-
-    pub async fn push_queued(&self, cmd: Command) {
-        if let Some(queued) = &self.queued_commands {
-            queued.lock().await.push(cmd);
         }
     }
 }

@@ -1,7 +1,6 @@
 use std::sync::Arc;
+use rand::{rng, Rng, distr::Alphanumeric};
 use tokio::sync::Mutex;
-use rand::{rng, Rng};
-use rand::distr::Alphanumeric;
 use crate::client::ReplicaClient;
 
 static DEF_BIND: &str = "127.0.0.1";
