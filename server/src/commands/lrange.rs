@@ -15,13 +15,13 @@ pub async fn cmd_lrange(args: &[String], client: &Client, db: Database) {
         args[2].parse::<i32>()
     ) {
         (Ok(start), Ok(stop)) => (start, stop),
-        _ => {
+        _ => { // Unparsable
             client.tx.send(Response::ErrNotInteger.into()).unwrap();
             return;
         }
     };
 
-    match db.lock().await.get_mut(key) {
+    let res = match db.lock().await.get_mut(key) {
         Some(value) => match &mut value.val {
             ValueType::StringList(val_list) => { // An existing list is found
                 // Adjust + clamp start and stop
@@ -31,25 +31,25 @@ pub async fn cmd_lrange(args: &[String], client: &Client, db: Database) {
                 stop = adjust(stop);
                 if start < 0 { start = 0; }
                 if stop < 0 { stop = -1; }
-                // + Clamp stop to list range
+                // Clamp stop to list range
                 stop = min(stop, val_list_len - 1);
 
-                if start > stop { // Invalid post-adjustment
+                if start > stop { // Invalid range post-adjustment
                     client.tx.send(Response::EmptyArray.into()).unwrap();
                     return;
                 }
 
-                // Build bulk string
+                // Build array
                 let range_size = stop - start + 1;
-                let mut bulk_str = format!("*{range_size}\r\n");
-                for val in val_list.iter().skip(start as usize)
-                                   .take(range_size as usize) {
-                    bulk_str.push_str(&format!("${}\r\n{val}\r\n", val.len()));
+                let mut res = format!("*{range_size}\r\n");
+                for val in val_list.iter().skip(start as usize).take(range_size as usize) {
+                    res.push_str(&format!("${}\r\n{val}\r\n", val.len()));
                 }
 
-                client.tx.send(bulk_str.into_bytes()).unwrap();
-            }, // Value is of the wrong type
-            _ => client.tx.send(Response::WrongType.into()).unwrap()
-        }, None => client.tx.send(Response::EmptyArray.into()).unwrap()
-    }
+                res.into_bytes()
+            }, _ => Response::WrongType.into() // Value is of the wrong type
+        }, None => Response::EmptyArray.into() // List not found
+    };
+
+    client.tx.send(res).unwrap();
 }
