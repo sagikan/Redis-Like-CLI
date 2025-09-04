@@ -1,4 +1,4 @@
-use std::{collections::{VecDeque, HashMap}, error::Error, sync::Arc, future::Future};
+use std::{collections::{VecDeque, HashMap, BTreeSet}, error::Error, sync::Arc, cmp::Ordering, future::Future};
 use tokio::sync::{Mutex, MutexGuard};
 use crate::client::{Client, BlockedClient};
 use crate::rdb::RDBFile;
@@ -71,6 +71,37 @@ pub struct Stream {
 }
 
 #[derive(Clone)]
+pub struct SetMember {
+    pub member: String,
+    pub score: f64
+}
+
+impl PartialEq for SetMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.member == other.member
+        && self.score.to_bits() == other.score.to_bits()
+    }
+}
+
+impl Eq for SetMember {}
+
+impl PartialOrd for SetMember {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SetMember {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.score.total_cmp(&other.score) {
+            // Equal float score => compare member String values
+            Ordering::Equal => self.member.cmp(&other.member),
+            ord => ord
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Value {
     pub val: ValueType,
     pub exp: Option<ExpiryType>
@@ -80,7 +111,8 @@ pub struct Value {
 pub enum ValueType {
     String(String),
     StringList(VecDeque<String>),
-    Stream(Stream)
+    Stream(Stream),
+    SortedSet(BTreeSet<SetMember>)
 }
 
 #[derive(Clone)]

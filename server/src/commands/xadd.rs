@@ -105,8 +105,10 @@ pub async fn cmd_xadd(to_send: bool, args: &[String], client: &Client,
             Some(value) => match &value.val {
                 // An existing stream is found
                 ValueType::Stream(stream) => stream.entries.lock().await.push_back(entry),
-                // Value is of the wrong type
-                _ => client.send_if(to_send, Response::WrongType)
+                _ => { // Value is of the wrong type
+                    client.send_if(to_send, Response::WrongType);
+                    return;
+                }
             }, None => {
                 let entries = Entries::default();
                 // Insert entry + create stream

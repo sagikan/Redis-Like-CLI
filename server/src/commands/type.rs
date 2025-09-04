@@ -11,7 +11,8 @@ pub async fn cmd_type(args: &[String], client: &Client, db: Database) {
         Some(value) => match &value.val {
             ValueType::String(_) => "string",
             ValueType::StringList(_) => "list",
-            ValueType::Stream(_) => "stream"
+            ValueType::Stream(_) => "stream",
+            ValueType::SortedSet(_) => "sorted set",
         }, None => "none"
     };
 

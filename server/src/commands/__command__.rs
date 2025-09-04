@@ -15,6 +15,7 @@ declare!(ping, echo, r#type,
          set, get, incr, keys, // Strings
          push, pop, lrange, llen, // Lists
          xadd, xrange, xread, // Streams
+         zadd, // Sorted Sets
          multi, exec, discard, // Transactions
          subscribe, unsubscribe, publish, // SUB/PUB
          info, config, replconf, psync, wait, // Server functionality
@@ -74,6 +75,7 @@ impl Command {
             "XADD"        => cmd_xadd(to_send, args, &client, bundle.db, bundle.blocked_clients).await,
             "XRANGE"      => cmd_xrange(args, &client, bundle.db).await,
             "XREAD"       => cmd_xread(args, &client, bundle.db, bundle.blocked_clients).await,
+            "ZADD"        => cmd_zadd(args, &client, bundle.db).await,
             "INCR"        => cmd_incr(to_send, args, &client, bundle.db).await,
             "MULTI"       => cmd_multi(to_send, &client).await,
             "EXEC"        => cmd_exec(to_send, &client, bundle.clone()).await,
