@@ -17,11 +17,11 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
             return;
         }
     };
-    let member = &args[2];
+    let member = args[2].trim_matches('"');
 
     // Create set member
     let set_member = SetMember {
-        member: member.clone(),
+        member: member.to_string(),
         score
     };
 
