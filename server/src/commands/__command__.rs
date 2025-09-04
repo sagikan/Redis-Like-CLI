@@ -15,7 +15,7 @@ declare!(ping, echo, r#type,
          set, get, incr, keys, // Strings
          push, pop, lrange, llen, // Lists
          xadd, xrange, xread, // Streams
-         zadd, zrank, zrange, zcard, zscore, // Sorted Sets
+         zadd, zrank, zrange, zcard, zscore, zrem, // Sorted Sets
          multi, exec, discard, // Transactions
          subscribe, unsubscribe, publish, // SUB/PUB
          info, config, replconf, psync, wait, // Server functionality
@@ -80,6 +80,7 @@ impl Command {
             "ZRANGE"      => cmd_zrange(args, &client, bundle.db).await,
             "ZCARD"       => cmd_zcard(args, &client, bundle.db).await,
             "ZSCORE"      => cmd_zscore(args, &client, bundle.db).await,
+            "ZREM"        => cmd_zrem(args, &client, bundle.db).await,
             "INCR"        => cmd_incr(to_send, args, &client, bundle.db).await,
             "MULTI"       => cmd_multi(to_send, &client).await,
             "EXEC"        => cmd_exec(to_send, &client, bundle.clone()).await,
