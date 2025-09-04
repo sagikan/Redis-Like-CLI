@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use crate::db::{Database, SetMember, Value, ValueType};
 use crate::client::{Client, Response};
 
-pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
+pub async fn cmd_zadd(to_send: bool, args: &[String], client: &Client, db: Database) {
     if args.len() != 3 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -13,7 +13,7 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
     let score = match args[1].parse::<f64>() {
         Ok(s) => s,
         _ => {
-            client.tx.send(Response::ErrNotFloat.into()).unwrap();
+            client.send_if(to_send, Response::ErrNotFloat);
             return;
         }
     };
@@ -38,7 +38,7 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
                 
                 set.len() - prev_set_len
             }, _ => { // Value is of the wrong type
-                client.tx.send(Response::WrongType.into()).unwrap();
+                client.send_if(to_send, Response::WrongType);
                 return;
             }
         }, None => { // Set not found
@@ -56,5 +56,5 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
         }
     };
 
-    client.tx.send(format!(":{num_new_members}\r\n").into_bytes()).unwrap();
+    client.send_if(to_send, format!(":{num_new_members}\r\n").as_bytes());
 }

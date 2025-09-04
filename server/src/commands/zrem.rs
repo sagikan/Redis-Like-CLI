@@ -1,9 +1,9 @@
 use crate::db::{Database, ValueType};
 use crate::client::{Client, Response};
 
-pub async fn cmd_zrem(args: &[String], client: &Client, db: Database) {
+pub async fn cmd_zrem(to_send: bool, args: &[String], client: &Client, db: Database) {
     if args.len() != 2 {
-        client.tx.send(Response::ErrArgCount.into()).unwrap();
+        client.send_if(to_send, Response::ErrArgCount);
         return;
     }
 
@@ -22,11 +22,11 @@ pub async fn cmd_zrem(args: &[String], client: &Client, db: Database) {
                 
                 prev_set_len - set.len()
             }, _ => { // Value is of the wrong type
-                client.tx.send(Response::WrongType.into()).unwrap();
+                client.send_if(to_send, Response::WrongType);
                 return;
             }
         }, None => 0 // Set not found
     };
 
-    client.tx.send(format!(":{num_rem_members}\r\n").into_bytes()).unwrap();
+    client.send_if(to_send, format!(":{num_rem_members}\r\n").as_bytes());
 }

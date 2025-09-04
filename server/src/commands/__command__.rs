@@ -55,7 +55,7 @@ impl Command {
             return;
         }
 
-        let to_send = !self.is_propagated; // Propagated => no reply
+        let to_send = !self.is_propagated; // Propagated => no reply on writes
         let args = self.args.as_deref().unwrap_or(&[]);
         // Handle command
         match uc_name.as_str() {
@@ -75,12 +75,12 @@ impl Command {
             "XADD"        => cmd_xadd(to_send, args, &client, bundle.db, bundle.blocked_clients).await,
             "XRANGE"      => cmd_xrange(args, &client, bundle.db).await,
             "XREAD"       => cmd_xread(args, &client, bundle.db, bundle.blocked_clients).await,
-            "ZADD"        => cmd_zadd(args, &client, bundle.db).await,
+            "ZADD"        => cmd_zadd(to_send, args, &client, bundle.db).await,
             "ZRANK"       => cmd_zrank(args, &client, bundle.db).await,
             "ZRANGE"      => cmd_zrange(args, &client, bundle.db).await,
             "ZCARD"       => cmd_zcard(args, &client, bundle.db).await,
             "ZSCORE"      => cmd_zscore(args, &client, bundle.db).await,
-            "ZREM"        => cmd_zrem(args, &client, bundle.db).await,
+            "ZREM"        => cmd_zrem(to_send, args, &client, bundle.db).await,
             "INCR"        => cmd_incr(to_send, args, &client, bundle.db).await,
             "MULTI"       => cmd_multi(to_send, &client).await,
             "EXEC"        => cmd_exec(to_send, &client, bundle.clone()).await,
