@@ -21,6 +21,7 @@ pub async fn cmd_zrange(args: &[String], client: &Client, db: Database) {
         }
     };
 
+    // Get + emit ranged set members
     let res = match db.lock().await.get(set_key) {
         Some(value) => match &value.val {
             ValueType::SortedSet(set) => { // An existing set is found

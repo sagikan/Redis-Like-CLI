@@ -11,6 +11,7 @@ pub async fn cmd_zrank(args: &[String], client: &Client, db: Database) {
     let set_key = &args[0];
     let member = &args[1];
 
+    // Get + emit set member's rank
     let res = match db.lock().await.get(set_key) {
         Some(value) => match &value.val {
             ValueType::SortedSet(set) => { // An existing set is found

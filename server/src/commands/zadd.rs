@@ -26,6 +26,7 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
     };
 
     let mut guard = db.lock().await;
+    // Get + emit # of new members in set
     let num_new_members = match guard.get_mut(set_key) {
         Some(value) => match &mut value.val {
             ValueType::SortedSet(set) => { // An existing set is found
@@ -55,6 +56,5 @@ pub async fn cmd_zadd(args: &[String], client: &Client, db: Database) {
         }
     };
 
-    // Emit # of new members in set
     client.tx.send(format!(":{num_new_members}\r\n").into_bytes()).unwrap();
 }

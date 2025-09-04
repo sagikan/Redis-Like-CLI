@@ -21,6 +21,7 @@ pub async fn cmd_lrange(args: &[String], client: &Client, db: Database) {
         }
     };
 
+    // Get + emit ranged list elements
     let res = match db.lock().await.get_mut(key) {
         Some(value) => match &mut value.val {
             ValueType::StringList(val_list) => { // An existing list is found
