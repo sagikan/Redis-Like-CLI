@@ -10,6 +10,32 @@ pub async fn cmd_replconf(args: &[String], client: &Client,
             args[0].to_uppercase().as_str(),
             args[1].as_str(),
         ) {
+            (true, "GETSTREAM", offset_str) => match offset_str.parse::<usize>() {
+                Ok(offset) => {
+                    let mut state_guard = repl_state.lock().await;
+                    let stream = state_guard.replicas.as_mut()
+                        .and_then(|replicas| replicas.iter_mut()
+                            .find(|replica| replica.client.tx.same_channel(&client.tx))
+                            .map(|replica| {
+                                replica.ack_offset = offset;
+                                replica.stream.clone()
+                            }));
+                    drop(state_guard);
+
+                    match stream {
+                        Some(stream) => {
+                            let mut stream = stream.lock().await;
+                            let payload: Vec<u8> = stream.drain(..).flatten().collect();
+                            let mut response = format!("${}\r\n", payload.len()).into_bytes();
+                            response.extend(payload);
+                            response.extend_from_slice(b"\r\n");
+                            response
+                        },
+                        None => Response::Nil.into()
+                    }
+                },
+                Err(_) => Response::ErrSyntax.into()
+            },
             (true, "ACK", offset_str) => match offset_str.parse::<usize>() {
                 Ok(offset) => {
                     // Update replica's offset in list
@@ -33,7 +59,8 @@ pub async fn cmd_replconf(args: &[String], client: &Client,
                     offset.to_string().len()
                 ).into_bytes()
             }, _ => Response::ErrSyntax.into()
-        }, _ => Response::ErrArgCount.into()
+        },
+        _ => Response::ErrArgCount.into()
     };
 
     client.tx.send(bulk_str).unwrap();

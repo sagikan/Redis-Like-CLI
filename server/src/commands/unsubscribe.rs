@@ -10,6 +10,9 @@ pub async fn cmd_unsubscribe(args: &[String], client: &Client, subs: Subscriptio
     let channel = &args[0];
     // Unsubscribe (double-edged) + get updated # of channels client is subbed to
     let sub_count = client.unsub(channel).await;
+    if sub_count == 0 {
+        client.set_sub_mode(false).await;
+    }
     {
         let mut subs_guard = subs.lock().await;
         if let Some(sub_list) = subs_guard.get_mut(channel.as_str()) {

@@ -44,22 +44,13 @@ pub async fn cmd_wait(args: &[String], client: &Client, repl_state: ReplState) {
                     state_guard.replicas.as_ref().unwrap().clone()
                 };
 
-                let mut sent_getack = false;
                 for repl in replicas {
                     if repl.ack_offset >= last_write { // Acknowledgement check
                         ack += 1;
-                    } else if ack < num_repl {
-                        // Dispatch GETACK to replica for offset update
-                        repl.client.tx.send(
-                            b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-                        .to_vec()).unwrap();
-                        sent_getack = true;
                     }
                 }
                 
-                if sent_getack { // Allow catch-up
-                    sleep(Duration::from_millis(100)).await; 
-                }
+                sleep(Duration::from_millis(100)).await;
             }
 
             ack

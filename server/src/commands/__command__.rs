@@ -18,7 +18,7 @@ declare!(ping, echo, r#type,
          zadd, zrank, zrange, zcard, zscore, zrem, // Sorted Sets
          multi, exec, discard, // Transactions
          subscribe, unsubscribe, publish, // SUB/PUB
-         info, config, replconf, psync, wait, // Server functionality
+         info, config, replconf, psync, wait, save, // Server functionality
          other);
 
 #[derive(Clone)]
@@ -33,12 +33,18 @@ impl Command {
     #[async_recursion::async_recursion]
     pub async fn execute(&mut self, client: &Client, bundle: Bundle) {
         if bundle.config.is_master && self.is_write() {
-            // Propagate command to replicas
-            if let Some(replica_list) = &bundle.repl_state.lock().await.replicas {
-                let cmd = self.to_resp_array();
-                for repl in replica_list {
-                    repl.client.tx.send(cmd.clone()).unwrap();
-                }
+            // Queue the command for each replica's polling replication stream
+            let streams = {
+                let state_guard = bundle.repl_state.lock().await;
+                state_guard.replicas.as_ref().map(
+                    |replicas| replicas.iter().map(
+                        |replica| replica.stream.clone()
+                    ).collect::<Vec<_>>()
+                ).unwrap_or_default()
+            };
+            let cmd = self.to_resp_array();
+            for stream in streams {
+                stream.lock().await.push_back(cmd.clone());
             }
         }
         
@@ -88,8 +94,9 @@ impl Command {
             "DISCARD"     => cmd_discard(to_send, &client).await,
             "INFO"        => cmd_info(args, &client, bundle.config.clone(), bundle.repl_state.clone()).await,
             "REPLCONF"    => cmd_replconf(args, &client, bundle.config.clone(), bundle.repl_state.clone()).await,
-            "PSYNC"       => cmd_psync(&client, bundle.repl_state.clone()).await,
+            "PSYNC"       => cmd_psync(&client, bundle.repl_state.clone(), bundle.db).await,
             "WAIT"        => cmd_wait(args, &client, bundle.repl_state.clone()).await,
+            "SAVE"        => cmd_save(args, &client, bundle.config.clone(), bundle.db).await,
             "CONFIG"      => grp_config(args, &client, bundle.config.clone()),
             "KEYS"        => cmd_keys(args, &client, bundle.db).await,
             "SUBSCRIBE"   => cmd_subscribe(args, &client, bundle.subs).await,
@@ -117,7 +124,7 @@ impl Command {
     }
 
     pub fn from(resp_str: &[u8], is_propagated: bool) -> Option<Self> {
-        let unparsed_str = str::from_utf8(resp_str).unwrap();
+        let unparsed_str = str::from_utf8(resp_str).ok()?;
         let mut lines = unparsed_str.split("\r\n");
         lines.next(); // Skip array header
 
@@ -126,8 +133,11 @@ impl Command {
             // Skip non-bulk-string-length lines
             if !curr_line.starts_with('$') { continue; }
             // Get length and add next line to parsed Vec
-            let len = curr_line[1..].parse().unwrap();
+            let len = curr_line[1..].parse::<usize>().ok()?;
             if let Some(val) = lines.next() {
+                if val.len() < len {
+                    return None;
+                }
                 parsed.push(val[..len].to_string());
             }
         }
@@ -165,12 +175,13 @@ impl Command {
         res
     }
 
-    fn is_write(&self) -> bool {
+    pub fn is_write(&self) -> bool {
         matches!(
             self.name.to_uppercase().as_str(),
             "SET" | "INCR" | // Keyspace
             "RPUSH" | "LPUSH" | "RPOP" | "LPOP" | // Lists
             "XADD" | // Streams
+            "ZADD" | "ZREM" | // Sorted sets
             "MULTI" | "EXEC" | "DISCARD" // Transactions
         )
     }
