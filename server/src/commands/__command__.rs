@@ -30,6 +30,7 @@ pub struct Command {
 }
 
 impl Command {
+    #[async_recursion::async_recursion]
     pub async fn execute(&mut self, client: &Client, bundle: Bundle) {
         if bundle.config.is_master && self.is_write() {
             // Propagate command to replicas

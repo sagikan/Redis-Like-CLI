@@ -15,8 +15,8 @@ use crate::rdb::RDBFile;
 use crate::client::{get_next_id, Client_, Client, Response};
 use crate::commands::Command;
 
-static SML_BUFSIZE: usize = 256;
-static BIG_BUFSIZE: usize = 1024;
+const SML_BUFSIZE: usize = 256;
+const BIG_BUFSIZE: usize = 1024;
 
 async fn send_and_verify(
     stream: &mut TcpStream, to_write: Vec<u8>, expected: Vec<u8>, error: &str

@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 use crate::client::ReplicaClient;
 
 static DEF_BIND: &str = "127.0.0.1";
-static DEF_PORT: u16 = 6379;
+static DEF_PORT: u16 = 6380;
 pub static DEF_DB_DIR: &str = ".";
 pub static DEF_DB_FILE: &str = "dump.rdb";
 
