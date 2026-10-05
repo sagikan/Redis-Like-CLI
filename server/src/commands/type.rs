@@ -1,12 +1,11 @@
-use crate::db::{Database, ValueType};
-use crate::client::{Client, Response};
+use crate::core::db::{Database, ValueType};
+use crate::core::client::{Client, Response};
 
 pub async fn cmd_type(args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
-    
     let val_type = match db.lock().await.get(&args[0]) {
         Some(value) => match &value.val {
             ValueType::String(_) => "string",

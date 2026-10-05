@@ -1,13 +1,12 @@
-use crate::db::{Database};
-use crate::client::{Client, Response};
-use crate::commands::_helpers_::glob;
+use crate::core::db::{Database};
+use crate::core::client::{Client, Response};
+use crate::commands::helpers::glob;
 
 pub async fn cmd_keys(args: &[String], client: &Client, db: Database) {
     if args.len() != 1 {
         client.tx.send(Response::ErrArgCount.into()).unwrap();
         return;
     }
-
     let pattern = args[0].trim_matches('"'); // Remove "s
     
     let mut matching: Vec<&String> = Vec::new();

@@ -1,0 +1,62 @@
+use std::collections::BTreeSet;
+use crate::core::db::{Database, SetMember, Value, ValueType};
+use crate::core::client::{Client, Response};
+
+pub async fn cmd_zadd(to_send: bool, args: &[String], client: &Client, db: Database) {
+    if args.len() != 3 {
+        client.send_if(to_send, Response::ErrArgCount);
+        return;
+    }
+
+    // Extract set key, score, and member name
+    let set_key = &args[0];
+    let score = match args[1].parse::<f64>() {
+        Ok(s) => s,
+        _ => {
+            client.send_if(to_send, Response::ErrNotFloat);
+            return;
+        }
+    };
+    let member = args[2].trim_matches('"');
+
+    // Create set member
+    let set_member = SetMember {
+        member: member.to_string(),
+        score
+    };
+
+    let mut guard = db.lock().await;
+    // Get + emit # of new members in set
+    let num_new_members = match guard.get_mut(set_key) {
+        Some(value) => match &mut value.val {
+            ValueType::SortedSet(set) => { // An existing set is found
+                let prev_set_len = set.len();
+                
+                // Insert (update if already exists) set member
+                set.retain(|s| s.member != *member);
+                set.insert(set_member);
+                
+                set.len() - prev_set_len
+            }, _ => { // Value is of the wrong type
+                client.send_if(to_send, Response::WrongType);
+                return;
+            }
+        }, None => { // Set not found
+            let mut set_val: BTreeSet<SetMember> = BTreeSet::new();
+            // Insert set member + create set
+            set_val.insert(set_member);
+            let set = Value {
+                val: ValueType::SortedSet(set_val),
+                exp: None
+            };
+            // Insert set
+            guard.insert(set_key.clone(), set);
+
+            1
+        }
+    };
+
+    client.send_if(to_send, format!(":{num_new_members}\r\n").as_bytes());
+}
+
+

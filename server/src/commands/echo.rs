@@ -1,4 +1,4 @@
-use crate::client::{Client, Response};
+use crate::core::client::{Client, Response};
 
 pub fn cmd_echo(args: &[String], client: &Client) {
     if let Some(_val) = args.get(0) {
